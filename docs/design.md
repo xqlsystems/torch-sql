@@ -2,7 +2,8 @@
 
 _author_: Alex Merose
 _co-author_: Claude (Opus 5.5), via Claude Code
-_status_: Draft v2, for discussion. Nothing is built yet.
+_status_: Draft v3, for discussion. The spikes of §16 are done; nothing else
+is built.
 _last updated_: 2026-11-05
 _companion_: [Samudra on Empire AI Beta](samudra-on-beta.md), the
 production plan
@@ -504,7 +505,13 @@ not involved:
 - **The data path.** A relational plan over the Zarr archive reads only the
   chunks a batch needs, normalizes and masks them, cuts rollout windows, and
   hands each DDP rank its batches as tensors on its GPU. This is experiment
-  E2 (§3.3).
+  E2 (§3.3). Spike S9 built it on xarray-sql over a synthetic store shaped
+  like OM4: its batches equal those of Samudra's own normalization and
+  masking, but it is 1.6 to 3.2 times slower than Samudra's `cpu` loader.
+  Most of the time is xarray-sql's scan from Zarr to rows, which costs about
+  as much as the `cpu` loader's whole pipeline. Dropping land rows saves
+  little, because the mask is a join, so land chunks are still read. The
+  data path therefore depends on upstream work in xarray-sql's scan.
 - **Evaluation.** Rollout metrics such as RMSE over ocean cells, means over
   ocean basins, and comparisons with observations are queries over the
   model's outputs and the dataset. Their results come back as Xarray
@@ -558,15 +565,29 @@ the backward pass from *AOTAutograd*, the part of `torch.compile` that traces
 gradients ahead of time; torch-sql takes the forward graph only, because ddx
 writes the backward pass (D2).
 
+Spike S6 (§16) built such a backend. Parameters arrive as ordinary graph
+inputs, so each is an input table. Its gradients match eager autograd to
+1e-16, across a graph break and under DDP on two processes. Three details
+come out of it:
+
+- **Checkpoints** arrive as a `tag_activation_checkpoint` node, a marked
+  subgraph. Tracing to ATen inlines it and loses the mark, so the backend
+  reads regions (§11.2) from Dynamo's graph first.
+- **Partial tensors** pass through as a custom op, `torch_sql::restrict(x,
+  mask)`, which Dynamo and the tracer keep as one node, and which lowers to
+  the join with the mask (§8.3).
+- **Shapes.** By default, Dynamo makes a size symbolic the second time it
+  changes. The first version compiles with `dynamic=False`, so each batch
+  size compiles once, until lowerings can take sizes as parameters.
+
 Graph breaks are the fallback that P3 allows: code torch-sql can't lower runs
 as PyTorch, and torch-sql reports it. Guards (§2) decide when a cached
 program can be reused, which answers most of open question 7 (§17).
 
 The compile backend is the production frontend for Samudra's model, once the
 runtime runs XQL programs on the GPU. Before then it runs on the CPU, for
-correctness. How partial tensors pass through Dynamo (most likely as a custom
-op that marks a domain, which the backend propagates through the graph) is
-part of spike S6 (§16).
+correctness: in S6, a step of a small model took about 200 ms in SQL against
+0.2 ms in PyTorch, and Dynamo itself added nothing measurable.
 
 ### 6.6 One boundary, crossed both ways
 
@@ -578,14 +599,21 @@ reuse it. It has three parts.
 - **Transport** moves the bytes. It is Arrow's PyCapsule interface on the
   host and its device variant for GPU memory, with DLPack on the PyTorch side
   (§2). Transport belongs upstream: xarray-sql owns the round-trip seam (§2),
-  and the runtime owns device memory (§5). xarray-sql already exports
-  `__arrow_c_stream__`; the device variant is the open part, which spike S4
-  tests.
+  and the runtime owns device memory (§5). Spike S4 found that today it is
+  the host stream, then DLPack chunk by chunk: an Arrow array with no nulls
+  reaches PyTorch without a copy, and one with nulls is refused. Nothing in
+  the stack exports the device stream, and PyTorch reads no Arrow capsule,
+  so a device path needs both the upstream export and a small converter.
 - **Layout** turns long tables into dense tensors and back. Index columns
   hold positions (§8.1), so a complete tensor (§8.3) whose rows arrive in
   order is one buffer. A partial tensor becomes a dense tensor and a mask,
-  with absent cells filled as P6 says. Layout is torch-sql's, because the
-  mapping from dimensions to strides is PyTorch's.
+  with absent cells filled as P6 says, before DLPack sees it. Layout is
+  torch-sql's, because the mapping from dimensions to strides is PyTorch's.
+  S4 measured it on 10.5 million rows: a reshape of rows in order takes
+  9 µs, checking that they are in order 231 ms, a scatter by position
+  182 ms, and sorting them in DataFusion 3.9 s. So layout trusts an Exact
+  fact (§10) that rows are in order, scatters when there is none, and never
+  asks the engine to sort. DataFusion returns rows out of order today.
 - **Gradients** cross through autograd functions: in one direction, ddx's
   backward pass for an XQL op or graph; in the other, PyTorch's backward pass for
   a fallback. Accounting for each crossing (P3) lives here too.
@@ -668,9 +696,15 @@ each with its reason:
    Through the compile backend, DDP stays: each rank runs its compiled
    graphs, and DDP averages the gradients that ddx writes into `.grad`.
 4. **`torch_sql.sync()`** once per step, on the device only.
-5. **Exact GELU.** Samudra's CappedGELU uses the error function, `erf`, which
-   needs ddx's `erf` rule ([ddx#256](https://github.com/xqlsystems/ddx/pull/256))
-   and an engine function. This is a dependency, not a model change.
+5. **Exact GELU.** Samudra's CappedGELU uses the error function, `erf`. It
+   needs ddx's `erf` rule ([ddx#256](https://github.com/xqlsystems/ddx/pull/256)),
+   and spike S8 found that neither DataFusion 54 nor DuckDB 2.0 has the
+   function. Until both exist, torch-sql can use GELU's tanh form, which differs from
+   it by at most 5 × 10⁻⁴, or decompose `erf` into supported functions.
+6. **Gradient clipping reads back.** Samudra clips with
+   `error_if_nonfinite=True`, which reads two values back every step, before
+   the optimizer runs (spike S5). On the device, that is a sync in the middle
+   of the step; torch-sql should offer to check at `sync()` instead.
 
 `torch.utils.checkpoint`, in-place `+=`, `F.pad` and `F.interpolate` should
 need no changes.
@@ -786,10 +820,19 @@ A tensor created from Python values (`torch.tensor([0.25, 0.75])`) becomes a
 
 The device copies torchax's mechanism (§2):
 
-- `import torch_sql` renames `PrivateUse1` to `"sql"` and registers a device
-  module, so `device="sql"` and `.to("sql")` work.
+- `import torch_sql` renames `PrivateUse1` to `"sql"`, so `device="sql"`
+  and `.to("sql")` parse.
 - `torch_sql.Tensor` is a wrapper subclass, allocated on PyTorch's `meta`
   device (which tracks shapes and dtypes but holds no data).
+
+Spikes S1 and S2 found that the rename alone is fragile. A wrapper tensor
+whose device is `"sql"` makes the first op that autograd records abort the
+process, in C++, because PyTorch finds no device guard for it. PyTorch's
+`torch.utils.backend_registration._setup_privateuseone_for_python_backend`
+registers one from Python, and then autograd, checkpointing and
+`torch.compile` all work. It is experimental and private, against the spirit
+of P5. Allocating on `meta`, as torchax does, needs neither, at the cost of
+`p.device` not reading `"sql"`. Which to use is open question 11 (§17).
 - An `Environment` holds a `TorchFunctionMode`, a `TorchDispatchMode` and the
   op table. While it is active, every op on a `"sql"` tensor, and every op that
   creates one, goes through `Environment.dispatch`.
@@ -820,6 +863,10 @@ option, after which ddx's `to_sql` could print SQL for each dialect. Either
 way, the graph stays torch-sql's own small IR, so the output format can change
 without touching the op table.
 
+Generated names (of CTEs and saved tables) must never equal a registered
+table's name. In SQL, a subquery's name hides a table of the same name, and
+spike S8 got wrong numbers, with no error, from exactly that.
+
 ### 9.3 The op table
 
 Each supported ATen op has a lowering: a Python function from input nodes to
@@ -832,8 +879,10 @@ def _mm(a: Node, b: Node) -> Node:
     return contraction(a, b, contract=[(a.dims[1], b.dims[0])])
 ```
 
-Ops with no lowering are decomposed with PyTorch's decompositions, aiming at
-core ATen. An op with neither raises `OperatorNotFound`, or runs in PyTorch
+Ops with no lowering are decomposed with `core_aten_decompositions()`.
+PyTorch's full decomposition table goes below core ATen, to its `prims` ops,
+which torch-sql shouldn't need to lower (spike S1). Decompositions also emit
+casts to the same dtype, which lower to nothing. An op with neither raises `OperatorNotFound`, or runs in PyTorch
 if the user allows it (P3). The first
 version covers what nanoGPT and Samudra use, plus the optimizer's ops.
 
@@ -843,7 +892,7 @@ version covers what nanoGPT and Samudra use, plus the optimizer's ops.
 |---|---|
 | elementwise (`add`, `mul`, `exp`, `tanh`, ...) | a projection, or a join on all indices |
 | `clamp`, `where` | `LEAST`/`GREATEST`, `CASE` |
-| `gelu` | `erf` (needs ddx#256 and an engine function) |
+| `gelu` | `erf`, which no engine has yet (§7.3 item 5); the tanh form until then |
 | `mm`, `bmm`, `linear`, `einsum` | a join on the contracted index, `SUM(a * b)` grouped by the rest |
 | `sum`, `mean`, `amax` | `GROUP BY` the kept indices |
 | `softmax`, `log_softmax` | a `MAX` for the shift, then a `SUM` for the normalizer |
@@ -853,6 +902,11 @@ version covers what nanoGPT and Samudra use, plus the optimizer's ops.
 | `pad` | rows of an index table |
 | `batch_norm`, `instance_norm`, `layer_norm` | an `AVG` for the mean, a second `AVG` for the variance, joined back |
 | `cat`, slicing, `permute` | §8.5 |
+
+Spike S8 wrote each of the rows from `conv2d` to `batch_norm` as SQL, with
+Samudra's padding and upsampling copied exactly. The same SQL runs on
+DataFusion and DuckDB, matches PyTorch to 3e-15 in float64, and ddx's
+gradients match autograd to 3e-14.
 
 These are the shapes einfold detects today (folds over joins, softmax
 pipelines), or will detect: convolution is planned for einfold, and we will
@@ -897,7 +951,9 @@ GROUP BY w.co, ia.out_lat, io.out_lon
 The geometry lives in the rows. Circular padding in longitude is a matter of
 which rows exist (output 0 reads input 359). Zero padding in latitude is
 absent rows. Dilation is a different table. Pooling and bilinear upsampling
-use the same form, with a weight column for upsampling.
+use the same form, with a weight column for upsampling. Samudra's upsampling
+is separable: one weight table for latitude and one for longitude, with its
+circular padding and cropping folded into the longitude weights.
 
 This follows a principle xarray-sql already states for geospatial work:
 arrays compute the geometry (the weights), and SQL applies it (the join).
@@ -910,6 +966,12 @@ It has three practical benefits:
 - the index tables are small (proportional to the grid size times the filter
   size), are computed once in NumPy from the op's parameters, and are
   registered and cached by shape.
+
+On a partial tensor, the same SQL over ocean rows only equals the dense
+masked reference, `conv(x * mask) * mask` with norms over ocean cells,
+forward and backward (S8). It also shows why absence isn't zero: with one
+NaN in a land cell, the dense reference gives NaN at 36 ocean outputs,
+because `NaN × 0` is NaN, while the SQL never reads that row.
 
 Whether index tables belong in torch-sql or in a shared XQL helper that
 einfold could also use is open (§17).
@@ -929,14 +991,30 @@ of 8 GB while planning.
 Through the compile backend, the same happens when Dynamo hands over a graph,
 and the compiled program runs each time that graph is called.
 
+Spike S8 measured the same on Samudra's blocks. For a stack of ConvNeXt-like
+blocks written as one query:
+
+| Blocks | DataFusion operators | DataFusion plan + run | DuckDB operators | DuckDB plan + run |
+|---|---|---|---|---|
+| 1 | 441 | 0.2 s | 75 | 0.05 s |
+| 2 | 7,978 | 6.4 s | 151 | 0.09 s |
+| 3 | 136,107 | 212 s | 227 | 0.20 s |
+
+DataFusion grows about 17 times per block, because each BatchNorm reads its
+input three times; DuckDB grows by 75 operators per block.
+
 So torch-sql chooses *cut points*, where a value is saved as a table instead
-of written into every query that reads it. The default is to save any
-aggregate read more than once. Choosing cut points is the same trade-off as
+of written into every query that reads it. The default is to save the input
+of every norm and every other value read more than once. On DataFusion this
+is required, not an optimization. Choosing cut points is the same trade-off as
 gradient checkpointing (memory against recomputation), and the runtime should
 eventually make it, using memory budgets for the hardware it runs on.
 
 The program for a step depends only on the graph's structure, the shapes and
-the dtypes, not on the values. torch-sql caches it, keyed on a hash of those,
+the dtypes, not on the values. Values that change every step without
+changing the graph, such as the learning rate, Adam's bias corrections and
+the EMA decay (Python numbers or 0-dimensional CPU tensors, spike S5), are
+parameters of the program, never literals in its SQL. torch-sql caches it, keyed on a hash of those,
 so a training loop builds it once and runs it every step, with prepared
 statements where the engine has them (xarray-sql's `Context.prepare`, ddx's
 `prepare`).
@@ -986,11 +1064,16 @@ databases, and it refuses what it can't differentiate.
 
 `torch_sql.Tensor` overrides `backward()`. It finds the parameters the loss
 depends on (leaf tensors with `requires_grad`), asks ddx for the gradient of
-the loss with respect to each parameter's table, and sets each parameter's
-`.grad` to a lazy tensor referring to the gradient. PyTorch's autograd still
+the loss with respect to all of their tables at once, and sets each
+parameter's `.grad` to a lazy tensor referring to its gradient. One call,
+`ddxdb.ad.grad(ctx, loss, ["w1.val", "w2.val", ...])`, gives one program
+with one backward pass; asking per parameter, as SQL's `grad()` does,
+repeats the forward pass for each. PyTorch's autograd still
 records its graph during the forward pass, but nothing ever runs it.
-`torch.optim` reads only `.grad`, so it works unchanged. This needs a spike
-(S1, §16) to confirm. Through the compile backend, ddx's program is instead
+`torch.optim` reads only `.grad`, so it works unchanged. Spike S1 confirmed
+this: ddx's gradients match autograd to 1e-16, PyTorch accepts a subclass as
+`.grad` (it checks device, dtype and size), `nn.Parameter` keeps the
+subclass, and autograd's graph never runs. Through the compile backend, ddx's program is instead
 the backward pass of an autograd function (§6.5), and PyTorch's autograd
 calls it.
 
@@ -1003,15 +1086,29 @@ recompute option in [ddx#251](https://github.com/xqlsystems/ddx/issues/251);
 torch-sql needs it in the form of *regions*: a named relation inside which
 nothing is saved except what a policy names. torch-sql replaces
 `torch.utils.checkpoint` while its environment is active, records the block's
-ops as a region, and passes ddx the region's name and a policy. How to
-replace the function cleanly is spike S2. Dynamo already records
-`torch.utils.checkpoint` as a marked subgraph, which the compile backend
-would turn into the same region (spike S6).
+ops as a region, and passes ddx the region's name and a policy.
+
+Spike S2 found how. Samudra calls `torch.utils.checkpoint.checkpoint` through
+the module, and some of its models use `apply_activation_checkpointing`,
+which wraps modules in a `CheckpointWrapper`. While its environment is
+active, torch-sql replaces the module's function, and at `.to("sql")` the
+`checkpoint_fn` of each `CheckpointWrapper`, with one that opens a region
+named after the block's module path, calls the block, and closes the region.
+A call bound before that (`from torch.utils.checkpoint import checkpoint`)
+would be missed, so torch-sql also raises when checkpoint's saved-tensor
+hook is active with no region open. Through the compile backend, regions
+come from Dynamo's `tag_activation_checkpoint` nodes instead (§6.5).
+
+Spike S3 found that a region can't be named by a CTE or a view: neither
+DataFusion's nor DuckDB's Substrait producer keeps those names. A marker
+function, such as `ddx_name(expr, 'unet.layers.3')`, survives both, so ddx
+needs one (ddx#251).
 
 ### 11.3 Stopping gradients
 
 `x.detach()` and `torch.no_grad()` become `ddx_stop_gradient`, ddx's marker for
-a value that gets no gradient. Samudra uses this to cut the rollout's gradient
+a value that gets no gradient. It must be registered on the session first
+(`ddxdb.ad.register_stop_gradient`, spike S3). Samudra uses this to cut the rollout's gradient
 every few steps.
 
 ### 11.4 Forward values besides the loss
@@ -1026,10 +1123,15 @@ are separate queries.
 ### 11.5 The optimizer
 
 `torch.optim.Adam` and `clip_grad_norm_` are ordinary tensor ops, so torch-sql
-lowers them like any other. By default PyTorch's optimizers use `_foreach_*`
-ops, which apply one op to a list of tensors at once, and optionally fused
-kernels. torch-sql lowers or decomposes the `_foreach_*` ops (spike S5) and
-refuses `fused=True`. Updating a parameter in place replaces its graph node
+lowers them like any other. PyTorch's optimizers can use `_foreach_*` ops,
+which apply one op to a list of tensors at once, or fused kernels. Spike S5
+found that on a tensor subclass the default is the plain loop, one tensor at
+a time, while `foreach=True` sends 19 different `_foreach_*` ops, none of
+which PyTorch decomposes. One rule lowers all but one of them: apply the
+plain op to each tensor. The exception, `_foreach_norm`, is
+`linalg_vector_norm` per tensor. torch-sql refuses `fused=True`. Samudra's
+whole optimizer path (Adam, its cosine schedule, clipping and EMA) needs 18
+ops. Updating a parameter in place replaces its graph node
 (§8.6); at `sync()`, the new parameter tables are saved and the old ones
 dropped.
 
@@ -1075,14 +1177,22 @@ a canonical
 [fixed-shape tensor](https://arrow.apache.org/docs/format/CanonicalExtensions.html)
 type, whose values are dense arrays of one shape. If dense intermediates can
 travel between an engine's operators as Arrow values of that kind, the runtime needs no second implementation of SQL's
-semantics. A spike will find out (S4). The same transport carries tensors
-across the boundary with PyTorch (§6.6).
+semantics. Spike S4 found that a fixed-shape tensor column keeps its type
+through DataFusion's projections, filters and sorts, and a projection keeps
+the same buffer. DuckDB drops the type to a plain list of fixed size, which
+keeps the values but loses the shape. Whether a GPU can read such values in
+place from Grace memory, on the Beta cluster, is still untested. The same
+transport carries tensors across the boundary with PyTorch (§6.6).
 
 ### 12.3 Engine order
 
 1. **DataFusion**, with einfold. This is where xarray-sql's `Context` and
-   einfold live.
-2. **DuckDB**, which plans deep queries far more compactly (§9.6).
+   einfold live. They need one DataFusion version: today xarray-sql 0.6.0
+   pins 54, and ddxdb's and einfold's DataFusion extras pin 55 (spike S7).
+2. **DuckDB**, which plans deep queries far more compactly (§9.6). ddx runs
+   on DuckDB through its community Substrait extension, which exists for
+   DuckDB 1.5 but not yet 2.0 (spike S7), so torch-sql holds DuckDB at 1.5
+   for now.
 3. **Any Arrow or ADBC engine**, through SQL text in each engine's dialect.
    Engines with no Substrait producer need ddx's plan for them
    ([ddx#159](https://github.com/xqlsystems/ddx/issues/159)).
@@ -1147,6 +1257,9 @@ DDP's `all_reduce` out of the program.
   within the floating-point bound.
 - **Fallbacks.** Each allowed fallback is reported, and a fallback that isn't
   allowed raises (P3).
+- **Spikes.** The spikes of §16 exit non-zero when a finding stops holding,
+  so they also check that a newer PyTorch, ddx or engine hasn't changed an
+  answer.
 
 ---
 
@@ -1187,27 +1300,39 @@ Extras keep each layer optional (H3): `torch-sql[ddx]` for training,
 
 ## 16. Milestones
 
-**M0. Spikes.** Each answers one question with a small program:
+**M0. Spikes (done).** Each answers one question with a small program in
+[docs/spikes](spikes/README.md), whose docstring holds the evidence. All
+pass.
 
 - **S1.** Can a wrapper subclass override `backward()` so that ddx computes
-  the gradients and `torch.optim` works unchanged?
+  the gradients and `torch.optim` works unchanged? Yes (§11.1). A `"sql"`
+  device needs more than a rename (§9.1).
 - **S2.** How can torch-sql replace `torch.utils.checkpoint` cleanly while
-  its environment is active?
+  its environment is active? Replace the module's function and each
+  `CheckpointWrapper`'s, and guard with checkpoint's hook (§11.2).
 - **S3.** Do CTE and view names survive DataFusion's and DuckDB's Substrait
-  producers? If so, they can name ddx regions with no new SQL function.
+  producers? No. Regions need a marker function (§11.2).
 - **S4.** Can dense arrays pass between DataFusion's operators, and from
-  there to PyTorch, as Arrow values (in device memory, through the C Device
-  Data Interface) without copies? On the Beta cluster, can a GPU read them in
-  place from its Grace CPU's memory? This is the runtime's question, but the
-  boundary (§6.6) and torch-sql's performance depend on it.
+  there to PyTorch, as Arrow values without copies? On the host, chunk by
+  chunk, yes; no device path exists yet (§6.6, §12.2). Whether a GPU can
+  read them in place from Grace memory is still to test on Beta.
 - **S5.** Which `_foreach_*` ops do Adam and `clip_grad_norm_` call, and do
-  PyTorch's decompositions cover them?
+  PyTorch's decompositions cover them? 19, none decomposed; one rule lowers
+  them (§11.5).
 - **S6.** Can a `torch.compile` backend take Dynamo's forward graph, run it
   as SQL, and supply ddx's backward pass through an autograd function, with
   DDP still averaging the gradients? How do partial tensors pass through
-  Dynamo?
-- **S7.** Do xarray-sql, ddx, einfold and their engines build and pass their
-  tests on ARM, inside Samudra's container for the Beta cluster?
+  Dynamo? Yes, and as a custom op (§6.5).
+- **S7.** Do xarray-sql, ddx, einfold and their engines install in Samudra's
+  container for the Beta cluster? Every package has an ARM wheel; DataFusion
+  versions conflict (§12.3). Not yet run on ARM.
+- **S8.** Do Samudra's building blocks lower to portable SQL through index
+  tables, match PyTorch, and differentiate with ddx, masked and unmasked?
+  Yes, except `erf` (§7.3, §9.4, §9.5). A deep stack can't be one query on
+  DataFusion (§9.6).
+- **S9.** How fast is the co-processor's data path today? Correct, and 1.6
+  to 3.2 times slower than Samudra's `cpu` loader, mostly in xarray-sql's
+  scan (§6.3).
 
 **M1. nanoGPT.** First a two-layer MLP (a small fully connected network). Then
 nanoGPT on `device="sql"`, matching PyTorch on the CPU and `02_nanogpt.py`
@@ -1269,6 +1394,13 @@ After M5: the runtime (with others), GPUs, and distribution.
 10. **Splitting data across ranks.** Whether the co-processor's loader
     reproduces Samudra's sampler exactly (same windows on the same rank), or
     may choose its own split, for example by Zarr chunk.
+11. **How to register the device.** PyTorch's private Python-backend setup,
+    which makes `p.device` read `"sql"`, or the `meta` device, as torchax
+    does (§9.1). The first is experimental; the second is public but
+    reports the wrong device.
+12. **Pooling a partial tensor.** Whether an average pool over a coastline
+    averages only its ocean children, or counts land as zero. Like open
+    question 1, this changes the model.
 
 ---
 
@@ -1310,12 +1442,15 @@ distributing work belong to a separate runtime, proposed in xarray-sql#307.
 einfold's own design rules out execution ("einfold rewrites query plans; it
 never executes them").
 
-**D7. Convolution through index tables (provisional).** Index tables give
-equality-only joins that einfold and ddx handle with existing rules, and they
-match how xarray-sql already does upsampling and geospatial regridding.
-einfold will add convolution support; the shape is to be settled together.
+**D7. Convolution through index tables.** Index tables give equality-only
+joins that einfold and ddx handle with existing rules, and they match how
+xarray-sql already does upsampling and geospatial regridding. Spike S8
+showed that they are correct, forward and backward, for every block Samudra
+uses. What is still open is speed: einfold will add convolution support, and
+the shape it recognizes is to be settled together.
 
 **D8. Engine order.** DataFusion, then DuckDB, then any Arrow or ADBC engine.
+DuckDB stays at 1.5 until ddx's Substrait route works on 2.0 (§12.3).
 
 **D9. Positional index columns.** Index columns hold positions `0 .. n - 1`,
 as in duckdb-zarr and xarray-sql's default indexes, and keep their Xarray
@@ -1341,3 +1476,13 @@ PyTorch uses Arrow's PyCapsule interface and its device variant, owned by
 xarray-sql and the runtime, with DLPack on the PyTorch side. torch-sql owns
 only the mapping between long tables and dense tensors, and the gradients
 across the boundary (§6.6).
+
+**D14. Regions are marked with a function (2026-11-05).** Neither engine's
+Substrait producer keeps CTE or view names (spike S3), so torch-sql marks
+each checkpointed block with a function call that names it, and ddx learns
+that function (ddx#251).
+
+**D15. Cut points at every norm (2026-11-05).** On DataFusion, a stack of
+three ConvNeXt blocks as one query is 136,107 operators (spike S8). torch-sql
+saves the input of every norm, and every other value read more than once, as
+a table between plans (§9.6).
