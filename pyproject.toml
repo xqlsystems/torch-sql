@@ -1,0 +1,7 @@
+[project]
+name = "torch-sql"
+version = "0.1.0"
+description = "PyTorch programs as SQL on XQL (prototype)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
