@@ -1006,7 +1006,8 @@ input three times; DuckDB grows by 75 operators per block.
 So torch-sql chooses *cut points*, where a value is saved as a table instead
 of written into every query that reads it. The default is to save the input
 of every norm and every other value read more than once. On DataFusion this
-is required, not an optimization. Choosing cut points is the same trade-off as
+is required, not an optimization
+([xarray-sql#267](https://github.com/xqlsystems/xarray-sql/issues/267)). Choosing cut points is the same trade-off as
 gradient checkpointing (memory against recomputation), and the runtime should
 eventually make it, using memory budgets for the hardware it runs on.
 
@@ -1108,7 +1109,8 @@ needs one (ddx#251).
 
 `x.detach()` and `torch.no_grad()` become `ddx_stop_gradient`, ddx's marker for
 a value that gets no gradient. It must be registered on the session first
-(`ddxdb.ad.register_stop_gradient`, spike S3). Samudra uses this to cut the rollout's gradient
+(`ddxdb.ad.register_stop_gradient`, spike S3), which takes only DOUBLE
+([ddx#260](https://github.com/xqlsystems/ddx/issues/260)). Samudra uses this to cut the rollout's gradient
 every few steps.
 
 ### 11.4 Forward values besides the loss

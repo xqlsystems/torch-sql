@@ -233,9 +233,8 @@ These are requests to XQL's own repositories, made as each stage needs them:
 
 | Project | Request | For |
 |---|---|---|
-| xarray-sql | a release on DataFusion 55, the version ddxdb and einfold use | stage 0 |
-| ddxdb | DuckDB held below 2.0 until its Substrait route works there | stage 0 |
-| xarray-sql | a cheaper scan from Zarr to rows: today it costs as much as a whole dense loader (S9) | stage 1 |
+| xarray-sql | a release on DataFusion 55, the version ddxdb and einfold use ([xarray-sql#310](https://github.com/xqlsystems/xarray-sql/issues/310)) | stage 0 |
+| xarray-sql | a cheaper scan from Zarr to rows: today it costs as much as a whole dense loader ([xarray-sql#311](https://github.com/xqlsystems/xarray-sql/issues/311)) | stage 1 |
 | xarray-sql | Arrow streams split by DDP rank, with read-ahead | stage 1 |
 | xarray-sql | the land mask as a filter pushed into the Zarr scan, so land chunks are never read | stage 1 |
 | xarray-sql | a fact that rows are ordered within each partition, so batches need no scatter (S4) | stage 1 |
