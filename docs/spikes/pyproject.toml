@@ -1,0 +1,28 @@
+[project]
+name = "torch-sql-spikes"
+version = "0"
+description = "Spikes for the torch-sql design (docs/design.md, §16). Not a package."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch>=2.15",
+    "ddxdb>=0.4.6",
+    "xarray-sql>=0.6.0",
+    "einfold>=0.2.0",
+    "datafusion",
+    "duckdb>=1.5",
+    "pyarrow>=23",
+    "numpy>=2",
+    "xarray",
+    "zarr>=3",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

@@ -17,3 +17,5 @@ Nothing is built yet. Start with the docs:
 - [docs/design.md](docs/design.md): the design.
 - [docs/samudra-on-beta.md](docs/samudra-on-beta.md): the production plan for
   Samudra on Empire AI's Beta cluster.
+- [docs/spikes/](docs/spikes/README.md): small programs that answer the
+  design's open questions, with their results.

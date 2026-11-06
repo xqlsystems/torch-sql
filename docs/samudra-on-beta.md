@@ -2,7 +2,8 @@
 
 _author_: Alex Merose
 _co-author_: Claude (Opus 5.5), via Claude Code
-_status_: Draft v1, for discussion. Nothing is built yet.
+_status_: Draft v2, for discussion. The design's spikes are done; nothing
+else is built.
 _last updated_: 2026-11-05
 _companion to_: [torch-sql: PyTorch models on composable databases](design.md)
 
@@ -89,9 +90,9 @@ interconnect; InfiniBand connects the racks.
 
 Four properties of Beta shape the plan:
 
-1. **The CPUs are ARM.** Every XQL package must build and run on
-   linux-aarch64, inside Samudra's container. This is spike S7 of the design
-   doc, and it comes before anything else.
+1. **The CPUs are ARM.** Every XQL package must run on linux-aarch64, inside
+   Samudra's container. Spike S7 of the design doc found that each one has
+   an ARM wheel, so nothing builds from source (§4, stage 0).
 2. **CPU memory sits next to the GPUs.** If the data path leaves its batches
    in Grace memory as Arrow buffers (Arrow is the columnar memory format XQL's
    engines share), a GPU might read them in place instead of copying them.
@@ -111,10 +112,24 @@ config, and never changes Samudra's results without saying so.
 
 torch-sql, xarray-sql, ddx and their engines (DataFusion, a Rust SQL engine,
 and DuckDB, an embedded SQL database) install in Samudra's ARM container and
-pass their tests in a Beta smoke job (the script's `SMOKE=1` mode, 2 GPUs on
-one host).
+pass a smoke test in a Beta job (the script's `SMOKE=1` mode, 2 GPUs on one
+host).
 
-**Done when:** the tests pass in a pinned container image on Beta.
+Spike S7 settled most of this without ARM hardware. Samudra's image runs
+Python 3.12 and pins `numpy<2` and `zarr<3`; the XQL packages install
+alongside those pins and pass the smoke test on x86_64. Three things remain:
+
+1. **One DataFusion version.** xarray-sql 0.6.0 pins DataFusion 54, while
+   ddxdb's and einfold's DataFusion extras pin 55, so the three can't share a
+   session until xarray-sql releases on 55. ddx works on 54; einfold needs 55.
+2. **DuckDB's Substrait extension.** ddx runs on DuckDB through a community
+   extension that exists for DuckDB 1.5 but not 2.0, and that DuckDB
+   downloads when first loaded. The image pins DuckDB 1.5 and installs the
+   extension at build time, since a compute node may have no network.
+3. **A run on ARM.** The spike's smoke test,
+   `docs/spikes/s7_arm_packaging/smoke.py`, has to run in the image on Beta.
+
+**Done when:** the smoke test passes in a pinned container image on Beta.
 
 ### Stage 1: the data path
 
@@ -131,6 +146,14 @@ masks exactly, normalized values within a stated floating-point bound.
 throughput from VAST and from Lustre, CPU and host memory per rank, and time
 to the first batch. Baselines are the `cpu` loader (production) and the
 `rust` loader (the strongest).
+
+**What we found so far.** Spike S9 built this loader over a synthetic store
+shaped like OM4. Its batches equal those of Samudra's own normalization and
+masking, but it is 1.6 to 3.2 times slower than the `cpu` loader per
+rollout window. Most of the time is xarray-sql's scan from Zarr to rows,
+which costs about as much as the `cpu` loader's whole pipeline, so stage 1
+waits on upstream work in that scan (§6). The gates are in order: first match
+the `cpu` loader, then compare with the `rust` loader.
 
 **What we expect.** Parity with the `rust` loader would be a good result;
 beating it on raw throughput is unlikely, because it already reads each plane
@@ -210,9 +233,11 @@ These are requests to XQL's own repositories, made as each stage needs them:
 
 | Project | Request | For |
 |---|---|---|
-| xarray-sql | linux-aarch64 wheels, or a documented build in an ARM container | stage 0 |
+| xarray-sql | a release on DataFusion 55, the version ddxdb and einfold use ([xarray-sql#310](https://github.com/xqlsystems/xarray-sql/issues/310)) | stage 0 |
+| xarray-sql | a cheaper scan from Zarr to rows: today it costs as much as a whole dense loader ([xarray-sql#311](https://github.com/xqlsystems/xarray-sql/issues/311)) | stage 1 |
 | xarray-sql | Arrow streams split by DDP rank, with read-ahead | stage 1 |
 | xarray-sql | the land mask as a filter pushed into the Zarr scan, so land chunks are never read | stage 1 |
+| xarray-sql | a fact that rows are ordered within each partition, so batches need no scatter (S4) | stage 1 |
 | xarray-sql, the runtime | Arrow device streams (`__arrow_c_device_stream__`), for batches in GPU or Grace memory | stage 1, later |
 | ddx | recompute regions ([ddx#251](https://github.com/xqlsystems/ddx/issues/251)), auxiliary outputs ([ddx#258](https://github.com/xqlsystems/ddx/issues/258)), `erf` ([ddx#256](https://github.com/xqlsystems/ddx/pull/256)) | stage 4 |
 | the runtime | running programs on GPUs ([xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)) | stage 5 |
@@ -222,8 +247,12 @@ These are requests to XQL's own repositories, made as each stage needs them:
 - **The baseline is strong.** The `rust` loader already deduplicates reads
   and overlaps them with compute, so stage 1 may show no speedup. We report
   that if so, and judge stage 1 on what the loader can express.
-- **ARM packaging.** If an XQL dependency has no ARM build, stage 0 becomes a
-  packaging project before anything else can start.
+- **Version skew.** ARM wheels exist for everything (S7), but xarray-sql,
+  ddxdb and einfold must agree on one DataFusion version, and DuckDB 2.0
+  breaks ddx's DuckDB route. Each new release can reopen this.
+- **The scan.** If xarray-sql's scan stays as slow as S9 measured, stage 1
+  can't match even the `cpu` loader, and the XQL loader stays a tool for
+  preprocessing experiments.
 - **Shared file systems.** 36 ranks reading one Zarr store over NFS behave
   differently from one laptop. Stage 1 measures both VAST and Lustre.
 - **Numerical drift.** Normalizing in SQL can sum in a different order from
