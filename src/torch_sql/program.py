@@ -34,7 +34,6 @@ shares.
 
 from __future__ import annotations
 
-import weakref
 from collections import defaultdict
 
 import torch
@@ -68,21 +67,18 @@ def cut_points(root: g.Node, read, budget: int | None, marked) -> list[g.Node]:
 def materialize(env, root: g.Node, resolve: dict) -> g.Table:
     """Save ``root``'s value as a table, saving its cut points first. Each
     query reads the tables before it, through ``resolve``, which this
-    extends."""
-    held = []
+    extends, and which holds them until ``root`` is saved."""
     for node in cut_points(
         root, lambda n: resolve.get(n.id, n), env.engine.cut_budget, env.marked_cuts
     ):
-        table = _save(env, node, resolve)
-        resolve[node.id] = table
-        held.append(table)
+        resolve[node.id] = _save(env, node, resolve)
     return _save(env, root, resolve)
 
 
 def _save(env, node: g.Node, resolve: dict) -> g.Table:
     table = g.Table(node.shape, node.dtype)
     env.engine.materialize(table.name, sql.query(node, resolve, key=True))
-    _adopt(env, table)
+    env._drop_with(table)
     return table
 
 
@@ -93,15 +89,15 @@ def backward(env, objective: g.Node, resolve: dict, wrt: list[g.Table]):
 
     Returns the loss's value as a table, and a node for each ``wrt``
     table's gradient (None for a table the loss doesn't read)."""
+    # Our own copy, which also holds the cut points' tables until the
+    # gradients exist.
     resolve = dict(resolve)
     read = lambda n: resolve.get(n.id, n)  # noqa: E731
-    cuts = [c for c in cut_points(objective, read, env.engine.cut_budget, env.marked_cuts)]
-    held = []  # the cut points' tables, kept until the gradients exist
+    cuts = cut_points(objective, read, env.engine.cut_budget, env.marked_cuts)
     cut_of = {}  # a cut point's table's id -> the cut point
     for node in cuts:
         table = _save(env, node, resolve)
         resolve[node.id] = table
-        held.append(table)
         cut_of[table.id] = node
     leaf_ids = {t.id for t in wrt}
     shares = defaultdict(list)  # a wrt table's id -> its gradient tables
@@ -126,7 +122,11 @@ def backward(env, objective: g.Node, resolve: dict, wrt: list[g.Table]):
                 cotangents[cut_of[t.id].id].append(share)
         return _adopt(env, g.Table((), F64, name=out.value))
 
-    value = differentiate(objective, resolve)
+    # SUM over the loss's one row: ddx can then show the loss is one row,
+    # which it can't for a scalar cross joined with another (a detached
+    # scalar). Each cut point's objective below is a SUM already.
+    summed = g.Select((), F64, (objective,), value=g.Agg("SUM", g.Col(0, "v")), group=True)
+    value = differentiate(summed, resolve)
     for node in reversed(cuts):
         if not cotangents[node.id]:
             continue
@@ -140,10 +140,20 @@ def backward(env, objective: g.Node, resolve: dict, wrt: list[g.Table]):
             value=g.Agg("SUM", g.Col(0, "v") * g.Col(1, "v")),
             group=True,
         )
-        segment = {k: v for k, v in resolve.items() if k != node.id}
-        differentiate(vjp, segment)
-    del held
-    return value, {t.id: total(shares[t.id]) if shares[t.id] else None for t in wrt}
+        # The segment computes this cut point from the ones before it, so
+        # it must not read the cut point's own table.
+        table = resolve.pop(node.id)
+        differentiate(vjp, resolve)
+        resolve[node.id] = table
+    grads = {}
+    for t in wrt:
+        if not shares[t.id]:
+            grads[t.id] = None
+        elif len(shares[t.id]) == 1:
+            grads[t.id] = shares[t.id][0]
+        else:  # saved once, rather than summed again by every reader
+            grads[t.id] = _save(env, total(shares[t.id]), resolve)
+    return value, grads
 
 
 def total(tables: list[g.Node]) -> g.Node:
@@ -163,13 +173,5 @@ def total(tables: list[g.Node]) -> g.Node:
 
 
 def _adopt(env, table: g.Table) -> g.Table:
-    """The engine table lives as long as the node."""
-    weakref.finalize(table, _drop, env.engine, table.name)
+    env._drop_with(table)
     return table
-
-
-def _drop(engine, name):
-    try:
-        engine.drop(name)
-    except Exception:  # pragma: no cover - the engine may be gone at exit
-        pass
