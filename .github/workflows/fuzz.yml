@@ -1,0 +1,44 @@
+name: Fuzz
+
+# The property-based tests of tests/fuzz run on every pull request with the
+# quick "ci" profile, as part of CI's `pytest`. This workflow runs them for
+# longer, nightly, and runs the mutation sweep (scripts/mutation_test.py)
+# weekly. Each Hypothesis failure prints its program and a
+# @reproduce_failure blob in the log.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # the nightly soak
+    - cron: "0 17 * * 0"  # the weekly mutation sweep, Sundays
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "soak or mutation"
+        default: soak
+
+jobs:
+  soak:
+    if: github.event.schedule == '0 6 * * *' || inputs.job == 'soak'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras --locked
+      # A fresh seed every night, so each run explores new programs; the
+      # seed is in the log for a replay.
+      - run: uv run pytest tests/fuzz -m "not pinned" --hypothesis-seed=${{ github.run_id }}
+        env:
+          HYPOTHESIS_PROFILE: nightly
+
+  mutation:
+    if: github.event.schedule == '0 17 * * 0' || inputs.job == 'mutation'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras --locked
+      - run: uv run python scripts/mutation_test.py >> "$GITHUB_STEP_SUMMARY"
+        env:
+          HYPOTHESIS_PROFILE: dev
