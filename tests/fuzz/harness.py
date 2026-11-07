@@ -70,6 +70,7 @@ def make_engine(name: str, budget="default") -> engines.Engine:
 #: when it's fixed. Set ``TORCH_SQL_FUZZ_KNOWN=0`` to see them all again.
 KNOWN = [
     ("duckdb", "Out of Range Error: input value", {"sin", "cos"}),
+    ("datafusion", "a tensor of shape () needs 1 rows; the table has 2", {"select"}),
 ]
 
 
