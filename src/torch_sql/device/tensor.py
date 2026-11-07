@@ -2,8 +2,9 @@
 
 It's a *wrapper subclass*: a ``torch.Tensor`` subclass that holds no data of
 its own, so PyTorch sends every ATen op on it to its ``__torch_dispatch__``.
-As in torchax, it's allocated on PyTorch's ``meta`` device, which tracks
-shapes and dtypes but holds no data. So ``t.device`` reads ``meta``, not
+torchax, a PyTorch backend that runs ops as JAX, makes the same kind of
+tensor, and as it does, torch-sql allocates them on PyTorch's ``meta``
+device, which tracks shapes and dtypes but holds no data. So ``t.device`` reads ``meta``, not
 ``sql``; giving it a ``sql`` device would need PyTorch's private
 Python-backend setup (spike S1, open question 11 of the design).
 

@@ -58,17 +58,10 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
     if not loss.requires_grad:
         raise RuntimeError("element 0 of tensors does not require grad and does not have a grad_fn")
     env = loss._env
-    if gradient is not None:
-        # The vector-Jacobian product along `gradient` is the gradient of
-        # sum(loss * gradient).
-        if not isinstance(gradient, Tensor):
-            gradient = env.tensor(gradient.detach().to(loss.dtype))
-        objective = (loss * gradient).sum()
-    elif loss.numel() != 1:
-        raise RuntimeError("grad can be implicitly created only for scalar outputs")
-    else:
-        objective = loss.reshape(())
-
+    # The objective is part of backward(), not of the caller's program: it
+    # carries a gradient even when backward() is called under no_grad().
+    with torch.enable_grad():
+        objective = _objective(loss, gradient, env)
     targets = leaves(loss)
     if inputs is not None:
         inputs = [inputs] if isinstance(inputs, torch.Tensor) else list(inputs)
@@ -87,6 +80,8 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
     for t in targets:
         node = t._node
         env.sync(t)
+        if any(t._node is other for other in tables):
+            raise AssertionError("two leaves share one table; their gradients would mix")
         tables.append(t._node)
         resolve[node.id] = t._node
     # Each stop-gradient node as a table, which ddx treats as a constant.
@@ -110,7 +105,12 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
     wrt = [table for table in tables if table.id in reached]
     grads = {}
     if wrt:
-        loss_sql = sql.query(objective._node, resolve)
+        # SUM over the one row: ddx can then show the loss is one row, which
+        # it can't for a scalar cross joined with another (a detached scalar).
+        summed = g.Select(
+            (), objective.dtype, (objective._node,), value=g.Agg("SUM", g.Col(0, "v")), group=True
+        )
+        loss_sql = sql.query(summed, resolve)
         out = env.engine.grad(loss_sql, [f"{t.name}.v" for t in wrt])
         # The program computed the loss too: reading it costs no query of
         # the forward pass.
@@ -130,6 +130,21 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
             grad = Tensor(node, env)
         with torch.no_grad():
             t.grad = grad if t.grad is None else t.grad + grad
+
+
+def _objective(loss, gradient, env):
+    """The scalar backward() differentiates."""
+    from .device import Tensor
+
+    if gradient is not None:
+        # The vector-Jacobian product along `gradient` is the gradient of
+        # sum(loss * gradient).
+        if not isinstance(gradient, Tensor):
+            gradient = env.tensor(gradient.detach().to(loss.dtype))
+        return (loss * gradient).sum()
+    if loss.numel() != 1:
+        raise RuntimeError("grad can be implicitly created only for scalar outputs")
+    return loss.reshape(())
 
 
 def _adopt(env, table: g.Table) -> g.Table:

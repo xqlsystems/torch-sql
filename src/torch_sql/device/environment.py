@@ -475,7 +475,11 @@ def _copy_(env: Environment, dst, src, non_blocking=False):
         src = env.tensor(src.detach().to(dst.dtype))
     if tuple(src.shape) != tuple(dst.shape):
         src = src.expand(dst.shape)
-    env._assign(dst, src._node)
+    # A node of dst's own, so that two tensors never share one: as leaves,
+    # they'd share a table, and their gradients would mix. Under no_grad
+    # (load_state_dict), the copy is a constant, as in PyTorch.
+    stop = not torch.is_grad_enabled() and src.requires_grad
+    env._assign(dst, g.identity(src._node, stop_gradient=stop))
     return dst
 
 
