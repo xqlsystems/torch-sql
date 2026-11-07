@@ -123,22 +123,20 @@ def log_softmax(ctx, x, dim, half_to_float):
 
 @op(aten.native_dropout.default)
 def native_dropout(ctx, x, p, train):
-    """Dropout's mask is drawn on the CPU, as PyTorch's CPU kernel draws it,
-    and registered; the output is ``x * mask / (1 - p)``."""
-    out, mask_meta = ctx.out
-    if not train or p == 0:
+    """As PyTorch's CPU kernel computes it: unless ``train`` is False (None
+    means training), the mask is drawn on the CPU, even when ``p`` is 0, so
+    the random stream stays PyTorch's, and the output is
+    ``x * mask * scale``, with ``scale`` 0 when ``p`` is 1. The product
+    keeps ``x``'s NaNs and signed zeros, where a ``CASE`` wouldn't."""
+    if train is not None and not train:
         from .creation import filled
 
-        return x, filled(ctx.env, mask_meta.shape, torch.bool, True)
-    noise = torch.empty(tuple(x.shape), dtype=x.dtype).bernoulli_(1 - p)
-    mask = ctx.env.upload(noise.to(torch.bool))
-    scale = 1.0 / (1.0 - p)
+        return x, filled(ctx.env, x.shape, torch.bool, True)
+    keep = 1.0 - p
+    scale = 0.0 if keep == 0 else 1.0 / keep
+    mask = ctx.env.upload(torch.empty(tuple(x.shape), dtype=torch.bool).bernoulli_(keep))
     y = elementwise(
-        x.shape,
-        F64,
-        [x, mask],
-        lambda v, k: g.call("case", k, v * scalar(scale, F64), scalar(0.0, F64)),
-        compute=[F64, torch.bool],
+        x.shape, F64, [x, mask], lambda v, k: v * k * scalar(scale, F64), compute=[F64, F64]
     )
     return y, mask
 

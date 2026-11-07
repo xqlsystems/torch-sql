@@ -324,3 +324,18 @@ def test_bitwise_of_integers_is_refused(env):
         torch.tensor([True, False], device="sql") & torch.tensor([True, True], device="sql"),
         torch.tensor([True, False]),
     )
+
+
+@pytest.mark.parametrize("p", [0.0, 0.3, 1.0])
+@pytest.mark.parametrize("train", [True, None, False])
+def test_native_dropout_as_the_cpu_kernel(env, p, train):
+    x = torch.tensor([[1.0, -2.0, math.nan], [-0.0, 3.0, -4.0]], dtype=F64)
+    torch.manual_seed(5)
+    out, mask = torch.ops.aten.native_dropout(x, p, train)
+    after = torch.rand(1)
+    torch.manual_seed(5)
+    got, got_mask = torch.ops.aten.native_dropout(x.to("sql"), p, train)
+    assert torch.equal(torch.rand(1), after)  # the same draws
+    same(got, out)
+    assert torch.equal(got_mask.cpu(), mask)
+    assert torch.equal(torch.signbit(got.cpu()), torch.signbit(out))
