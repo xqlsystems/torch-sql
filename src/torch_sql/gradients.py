@@ -23,12 +23,10 @@ on every engine.
 
 from __future__ import annotations
 
-import weakref
-
 import torch
 
 from . import graph as g
-from . import sql
+from . import program
 
 
 def leaves(loss: torch.Tensor) -> list[torch.Tensor]:
@@ -98,32 +96,18 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
         else:
             stack.extend(node.inputs)
 
-    def read(node):
-        return resolve.get(node.id, node)
-
-    reached = {n.id for n in g.topological([objective._node], read) if isinstance(n, g.Table)}
-    wrt = [table for table in tables if table.id in reached]
-    grads = {}
-    if wrt:
-        # SUM over the one row: ddx can then show the loss is one row, which
-        # it can't for a scalar cross joined with another (a detached scalar).
-        summed = g.Select(
-            (), objective.dtype, (objective._node,), value=g.Agg("SUM", g.Col(0, "v")), group=True
-        )
-        loss_sql = sql.query(summed, resolve)
-        out = env.engine.grad(loss_sql, [f"{t.name}.v" for t in wrt])
+    # The loss, and each leaf's gradient, through ddx, across the cut
+    # points the engine needs (torch_sql.program).
+    value, grads = program.backward(env, objective._node, resolve, tables)
+    if value is not None:
         # The program computed the loss too: reading it costs no query of
         # the forward pass.
-        value = _adopt(env, g.Table((), objective.dtype, name=out.value))
         env._saved[objective._node.id] = value
         objective._table = value
         if loss._node is objective._node:
             loss._table = value
-        for table in wrt:
-            name = out.gradients[table.name]
-            grads[table.id] = _adopt(env, g.Table(table.shape, table.dtype, name=name))
     for t, table in zip(targets, tables, strict=True):
-        node = grads.get(table.id)
+        node = grads[table.id]
         if node is None:  # a leaf the SQL doesn't read: its gradient is 0
             grad = torch.zeros_like(t)
         else:
@@ -145,17 +129,3 @@ def _objective(loss, gradient, env):
     if loss.numel() != 1:
         raise RuntimeError("grad can be implicitly created only for scalar outputs")
     return loss.reshape(())
-
-
-def _adopt(env, table: g.Table) -> g.Table:
-    """Take ownership of a table ddx left on the engine: it's dropped when
-    the node is."""
-    weakref.finalize(table, _drop, env.engine, table.name)
-    return table
-
-
-def _drop(engine, name):
-    try:
-        engine.drop(name)
-    except Exception:  # pragma: no cover - the engine may be gone at exit
-        pass
