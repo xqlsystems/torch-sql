@@ -12,10 +12,34 @@ scientific arrays. It has three frontends:
 Its first real model is [Samudra](https://github.com/m2lines/Samudra), an
 ocean emulator.
 
-Nothing is built yet. Start with the docs:
+The first milestone, M1 in the design, is under way: a two-layer MLP, then
+nanoGPT (Andrej Karpathy's small GPT), trained on `device="sql"`. Start with
+the docs:
 
 - [docs/design.md](docs/design.md): the design.
 - [docs/samudra-on-beta.md](docs/samudra-on-beta.md): the production plan for
   Samudra on Empire AI's Beta cluster.
 - [docs/spikes/](docs/spikes/README.md): small programs that answer the
   design's open questions, with their results.
+
+## Development
+
+torch-sql uses [uv](https://docs.astral.sh/uv/). From the repository root:
+
+```bash
+uv sync --all-extras   # PyTorch (CPU), ddxdb, DataFusion and DuckDB
+uv run pytest          # every test runs on both engines
+uv run ruff check && uv run ruff format --check
+```
+
+On NixOS, first put `libstdc++` and `zlib` on `LD_LIBRARY_PATH`, as the XQL
+repositories' `flake.nix` files do.
+
+The code follows the [package layout](docs/design.md#15-package-layout) of
+the design. What exists so far:
+
+- `torch_sql.graph`: the recorded graph, a small relational IR (§9.2);
+- `torch_sql.sql`: writes portable SQL from the graph;
+- `torch_sql.engines`: DataFusion and DuckDB, and ddx's gradient programs on
+  each (§12.1);
+- `torch_sql.boundary.layout`: dense tensors to long tables and back (§6.6).
