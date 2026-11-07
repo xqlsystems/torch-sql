@@ -49,6 +49,10 @@ class Engine:
         """Run ``sql`` and return its rows."""
         raise NotImplementedError
 
+    def exists(self, name: str) -> bool:
+        """Whether a table ``name`` is registered."""
+        raise NotImplementedError
+
     def materialize(self, name: str, sql: str) -> None:
         """Run ``sql`` and save its rows as the table ``name``."""
         raise NotImplementedError
@@ -89,6 +93,9 @@ class DataFusionEngine(Engine):
     def drop(self, name):
         self.ctx.deregister_table(name)
 
+    def exists(self, name):
+        return self.ctx.table_exist(name)
+
     def query(self, sql):
         return self.ctx.sql(sql).to_arrow_table()
 
@@ -127,6 +134,14 @@ class DuckDBEngine(Engine):
 
     def query(self, sql):
         return self.con.sql(sql).to_arrow_table()
+
+    def exists(self, name):
+        found = self.con.execute(
+            "SELECT 1 FROM duckdb_tables() WHERE table_name = ? "
+            "UNION ALL SELECT 1 FROM duckdb_views() WHERE view_name = ?",
+            [name, name],
+        )
+        return name in self._arrow or found.fetchone() is not None
 
     def materialize(self, name, sql):
         self.drop(name)

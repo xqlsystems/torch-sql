@@ -275,11 +275,14 @@ class UnionAll(Node):
                 raise ValueError("a UNION ALL's inputs must have its rank and dtype")
 
 
-def topological(roots) -> list[Node]:
+def topological(roots, resolve=lambda n: n) -> list[Node]:
     """Every node the ``roots`` depend on, each after its inputs. Iterative,
-    since a deep model's graph is deeper than Python's recursion limit."""
+    since a deep model's graph is deeper than Python's recursion limit.
+    ``resolve`` maps each node to the one to visit in its place (a table that
+    already holds its value, say)."""
     order, seen = [], set()
     for root in roots:
+        root = resolve(root)
         stack = [(root, False)]
         while stack:
             node, done = stack.pop()
@@ -290,5 +293,6 @@ def topological(roots) -> list[Node]:
                 continue
             seen.add(node.id)
             stack.append((node, True))
-            stack.extend((i, False) for i in reversed(node.inputs) if i.id not in seen)
+            inputs = [resolve(i) for i in node.inputs]
+            stack.extend((i, False) for i in reversed(inputs) if i.id not in seen)
     return order

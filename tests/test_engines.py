@@ -63,3 +63,13 @@ def test_grad_of_a_hand_built_loss(engine):
     torch.testing.assert_close(
         torch.tensor(gb.column("v")[0].as_py(), dtype=F64), br.grad, rtol=1e-13, atol=0
     )
+
+
+def test_exists(engine):
+    assert not engine.exists("_tsql_nothing")
+    engine.register("_tsql_something", to_table(torch.ones(2, dtype=F64)))
+    assert engine.exists("_tsql_something")
+    engine.drop("_tsql_something")
+    assert not engine.exists("_tsql_something")
+    engine.materialize("_tsql_made", "SELECT 1 AS v")
+    assert engine.exists("_tsql_made")

@@ -42,4 +42,18 @@ the design. What exists so far:
 - `torch_sql.sql`: writes portable SQL from the graph;
 - `torch_sql.engines`: DataFusion and DuckDB, and ddx's gradient programs on
   each (§12.1);
-- `torch_sql.boundary.layout`: dense tensors to long tables and back (§6.6).
+- `torch_sql.boundary.layout`: dense tensors to long tables and back (§6.6);
+- `torch_sql.device`: `device="sql"`, `torch_sql.Tensor` and the
+  `Environment` that records ops (§9.1);
+- `torch_sql.ops`: the op table (§9.3);
+- `torch_sql.index_tables`: index tables (§9.5), so far for `reshape`.
+
+```python
+import torch, torch_sql
+
+with torch_sql.Environment("duckdb"):
+    mlp = torch.nn.Sequential(torch.nn.Linear(3, 5), torch.nn.Tanh(), torch.nn.Linear(5, 2))
+    mlp = mlp.double().to("sql")
+    y = mlp(torch.randn(4, 3, dtype=torch.float64, device="sql"))
+    print(y)  # runs one SQL query on DuckDB
+```
