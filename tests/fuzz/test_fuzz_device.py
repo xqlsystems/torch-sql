@@ -16,7 +16,7 @@ import pytest
 import torch
 from fuzz_programs import Program, output_of, programs, scale
 from harness import check, close, make_engine, on_device, oracle, refusals_are_skips
-from hypothesis import given, note
+from hypothesis import assume, given, note
 from hypothesis import strategies as st
 
 from torch_sql import engines
@@ -239,3 +239,29 @@ def test_select_from_stacked_scalars(engine):
         a = torch.ones(3, dtype=torch.float64, device="sql")
         losses = torch.stack([a.sum(), (2 * a).sum()])
         assert losses[0].item() == 3.0 and losses[1].item() == 6.0
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@given(programs(modes=("smooth",)))
+def test_backward_twice_accumulates(engine, program):
+    """``.grad`` accumulates, as in PyTorch: two ``backward()`` calls on two
+    losses give the sum of their gradients."""
+    from fuzz_programs import leaf_tensors, run
+    from harness import weights
+
+    import torch_sql
+
+    note(repr(program))
+    _, expected, screens = oracle(program, grad=True)
+    assume(expected is not None and not screens.kink and not screens.domain)
+    with refusals_are_skips(), torch_sql.Environment(make_engine(engine)):
+        leaves = leaf_tensors(program, "sql", requires_grad=True)
+        out = run(program, leaves)[output_of(program)]
+        w = weights(out.shape).to("sql")
+        (out * w).sum().backward()
+        (out * w * 2.0).sum().backward()
+        got = [
+            torch.zeros(x.shape, dtype=x.dtype) if x.grad is None else x.grad.cpu() for x in leaves
+        ]
+    for k, (a, b) in enumerate(zip(got, expected, strict=True)):
+        close(a, 3 * b, max(1.0, scale([b])) * 3, f"accumulated gradient of leaf {k}")

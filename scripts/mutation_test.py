@@ -71,15 +71,15 @@ MUTANTS = [
     Mutant(
         "vjp-plus",
         "program.py",
-        'g.Col(0, "v") * g.Col(1, "v")),\n            group=True,\n        )\n        segment',
-        'g.Col(0, "v") + g.Col(1, "v")),\n            group=True,\n        )\n        segment',
+        'g.Col(0, "v") * g.Col(1, "v")),\n            group=True,\n        )\n        # The',
+        'g.Col(0, "v") + g.Col(1, "v")),\n            group=True,\n        )\n        # The',
         "a segment's vector-Jacobian product adds instead of multiplying",
     ),
     Mutant(
         "vjp-own-table",
         "program.py",
-        "segment = {k: v for k, v in resolve.items() if k != node.id}",
-        "segment = dict(resolve)",
+        "table = resolve.pop(node.id)",
+        "table = resolve[node.id]",
         "a cut point's segment reads its own table, so nothing flows past it",
     ),
     Mutant(
