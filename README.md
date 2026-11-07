@@ -48,7 +48,12 @@ the design. What exists so far:
 - `torch_sql.ops`: the op table (§9.3);
 - `torch_sql.index_tables`: index tables (§9.5), so far for `reshape`;
 - `torch_sql.gradients`: `backward()` through ddx (§11), so `torch.optim`
-  works unchanged.
+  works unchanged;
+- `torch_sql.device.functions`: PyTorch functions torch-sql lowers before
+  PyTorch decomposes them in C++ (attention, indexing with a list).
+
+nanoGPT's `model.py`, unchanged but for its GELU, trains on `device="sql"`
+and matches PyTorch step by step (`tests/test_nanogpt.py`).
 
 ```python
 import torch, torch_sql

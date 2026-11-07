@@ -62,4 +62,4 @@ def op(*funcs):
 
 
 # Import the families, which register their lowerings.
-from . import creation, elementwise, linalg, reductions, shape  # noqa: E402,F401
+from . import creation, elementwise, linalg, nn, reductions, shape  # noqa: E402,F401

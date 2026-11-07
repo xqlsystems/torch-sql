@@ -65,3 +65,18 @@ def reshape_table(env, src_sizes: tuple[int, ...], dst_sizes: tuple[int, ...]) -
         env.engine.register(table.name, pa.table(cols))
         env._index_tables[key] = table
     return env._index_tables[key]
+
+
+def slice_table(env, start: int, end: int) -> g.Table:
+    """The table relating positions ``start .. end - 1`` of a dimension to
+    positions ``0 .. end - start - 1`` of its slice: columns ``a0``
+    (source) and ``b0`` (destination). A slice is a join with it, not a
+    range filter, so every condition is an equality."""
+    key = ("slice", start, end)
+    if key not in env._index_tables:
+        src = np.arange(start, end, dtype=np.int64)
+        cols = {"a0": pa.array(src), "b0": pa.array(src - start), "v": pa.array(src)}
+        table = g.Table((end - start,), torch.int64)
+        env.engine.register(table.name, pa.table(cols))
+        env._index_tables[key] = table
+    return env._index_tables[key]

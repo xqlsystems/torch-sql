@@ -80,6 +80,19 @@ OPS = [
     "all",
     "reshape",
     "view",
+    # nanoGPT's ops
+    "nn.functional.embedding",
+    "nn.functional.layer_norm",
+    "softmax",
+    "log_softmax",
+    "nn.functional.cross_entropy",
+    "gather",
+    "masked_fill",
+    "split",
+    "split_with_sizes",
+    "nn.functional.scaled_dot_product_attention",
+    "nn.functional.gelu",
+    "tril",
 ]
 
 #: (op, why) for samples torch-sql refuses on purpose. Each refusal raises
@@ -87,6 +100,10 @@ OPS = [
 REFUSED = {
     "div": "rounding_mode",
     "nn.functional.linear": "a 1-d input, which PyTorch's matmul squeezes in place",
+    "nn.functional.gelu": "exact GELU needs erf (xqlsystems/ddx#256)",
+    "nn.functional.embedding": "padding_idx, max_norm or scale_grad_by_freq",
+    "nn.functional.cross_entropy": "class weights or label smoothing",
+    "nn.functional.scaled_dot_product_attention": "enable_gqa",
 }
 
 CASES = [o for o in op_db if o.name in OPS]
@@ -108,6 +125,8 @@ def test_op(engine, info):
             isinstance(t, torch.Tensor) and t.dtype not in (F64, torch.int64, torch.bool)
             for t in torch.utils._pytree.tree_leaves((sample.input, sample.args, sample.kwargs))
         ):
+            continue
+        if sample.kwargs.get("dropout_p"):  # random, so it can't match PyTorch
             continue
         expected = info(sample.input, *sample.args, **sample.kwargs)
         args = tree_map(lambda x: to_sql(env, x), (sample.input, sample.args, sample.kwargs))
