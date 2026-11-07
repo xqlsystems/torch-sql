@@ -18,6 +18,7 @@ read by name.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 
 import torch
 
@@ -68,6 +69,7 @@ FUNCTIONS = {
     "power": "power",
     "greatest": "greatest",
     "least": "least",
+    "isnan": "isnan",
 }
 
 AGGREGATES = {"SUM", "AVG", "MAX", "MIN", "COUNT"}
@@ -131,7 +133,7 @@ def cast_to(e: Expr, dtype: torch.dtype) -> Call:
     return Call(f"cast:{SQL_TYPES[dtype]}", (e,))
 
 
-def select(node: Select) -> str:
+def select(node: Select, resolve=lambda n: n) -> str:
     aliases = [f"t{k}" for k in range(len(node.inputs))]
     # Attach each equality to the latest input it reads, so that every input
     # joins on the ones before it; an input no equality reaches is a cross
@@ -144,9 +146,9 @@ def select(node: Select) -> str:
         conditions[max(reads)].append(f"{expr(a, aliases)} = {expr(b, aliases)}")
     if node.inputs and conditions[0]:
         raise ValueError("a join condition reads only the first input; write it as a filter")
-    parts = [f"{relation(node.inputs[0])} {aliases[0]}"] if node.inputs else []
+    parts = [f"{relation(resolve(node.inputs[0]))} {aliases[0]}"] if node.inputs else []
     for k in range(1, len(node.inputs)):
-        source = f"{relation(node.inputs[k])} {aliases[k]}"
+        source = f"{relation(resolve(node.inputs[k]))} {aliases[k]}"
         if conditions[k]:
             parts.append(f"JOIN {source} ON {' AND '.join(conditions[k])}")
         else:
@@ -158,8 +160,11 @@ def select(node: Select) -> str:
         sql += f" FROM {' '.join(parts)}"
     if node.where is not None:
         sql += f" WHERE {expr(node.where, aliases)}"
-    if node.group and node.index:
-        sql += f" GROUP BY {', '.join(expr(e, aliases) for e in node.index)}"
+    # A constant index (a dimension keepdim keeps) isn't grouped by: an
+    # integer literal in GROUP BY means a column position.
+    keys = [expr(e, aliases) for e in node.index if _cols(e)]
+    if node.group and keys:
+        sql += f" GROUP BY {', '.join(keys)}"
     return sql
 
 
@@ -180,32 +185,46 @@ def values(node: Values) -> str:
     return f"SELECT * FROM (VALUES {', '.join(rows)}) AS t({', '.join(cols)})"
 
 
-def union_all(node: UnionAll) -> str:
+def union_all(node: UnionAll, resolve=lambda n: n) -> str:
     cols = ", ".join((*node.columns, "v"))
-    return " UNION ALL ".join(f"SELECT {cols} FROM {relation(n)}" for n in node.inputs)
+    return " UNION ALL ".join(f"SELECT {cols} FROM {relation(resolve(n))}" for n in node.inputs)
 
 
-def body(node: Node) -> str:
-    """The ``SELECT`` that computes ``node`` from its inputs, by name."""
+def body(node: Node, resolve=lambda n: n) -> str:
+    """The ``SELECT`` that computes ``node`` from its inputs, by name.
+    ``resolve`` maps each input to the node to read in its place."""
     if isinstance(node, Select):
-        return select(node)
+        return select(node, resolve)
     if isinstance(node, Values):
         return values(node)
     if isinstance(node, UnionAll):
-        return union_all(node)
+        return union_all(node, resolve)
     if isinstance(node, Table):
         return f"SELECT {', '.join((*node.columns, 'v'))} FROM {node.name}"
     raise TypeError(f"no SQL for {type(node).__name__}")
 
 
-def query(root: Node) -> str:
+def query(root: Node, saved: Mapping[int, Table] | None = None, *, key: bool = False) -> str:
     """The SQL that computes ``root``: every node it depends on as a CTE,
-    then ``SELECT`` of ``root``'s columns."""
+    then ``SELECT`` of ``root``'s columns.
+
+    ``saved`` maps node ids to tables that already hold those nodes' values,
+    which the query reads instead of computing them again. With ``key``, a
+    scalar's query also returns the key column ``i`` its table needs (see
+    :class:`~torch_sql.graph.Table`).
+    """
+    saved = saved or {}
+
+    def resolve(node: Node) -> Node:
+        return saved.get(node.id, node)
+
+    root = resolve(root)
     ctes = []
-    for node in topological([root]):
+    for node in topological([root], resolve):
         if isinstance(node, Table):
             continue
-        ctes.append(f"{cte_name(node)} AS ({body(node)})")
-    cols = ", ".join((*root.columns, "v"))
-    final = f"SELECT {cols} FROM {relation(root)}"
+        ctes.append(f"{cte_name(node)} AS ({body(node, resolve)})")
+    cols = ["0 AS i"] if key and root.rank == 0 else []
+    cols += [*root.columns, "v"]
+    final = f"SELECT {', '.join(cols)} FROM {relation(root)}"
     return f"WITH {', '.join(ctes)} {final}" if ctes else final
