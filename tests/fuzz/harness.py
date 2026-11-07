@@ -71,6 +71,7 @@ def make_engine(name: str, budget="default") -> engines.Engine:
 KNOWN = [
     ("duckdb", "Out of Range Error: input value", {"sin", "cos"}),
     ("datafusion", "a tensor of shape () needs 1 rows; the table has 2", {"select"}),
+    ("duckdb", "not a scalar loss", {"expand"}),
 ]
 
 
@@ -78,14 +79,21 @@ KNOWN = [
 #: ops and computes a NaN anywhere is skipped on that engine.
 KNOWN_NAN = [
     ("datafusion", {"relu", "maximum"}, "DataFusion orders a negative NaN below every number"),
+    (
+        "datafusion",
+        {"reduce_amax", "reduce_amin"},
+        "DataFusion's grouped MAX of -inf is f64::MIN",
+    ),
 ]
 
 
 def _known_nan(program: Program, engine: str, values) -> str | None:
+    """A known finding, for a program that uses one of its ops and computes
+    a NaN or an infinity somewhere."""
     if os.environ.get("TORCH_SQL_FUZZ_KNOWN", "1") == "0":
         return None
     ops = {s.op for s in program.steps}
-    if not any(bool(torch.isnan(v.detach()).any()) for v in values):
+    if all(bool(torch.isfinite(v.detach()).all()) for v in values):
         return None
     return next((why for e, uses, why in KNOWN_NAN if e == engine and ops & uses), None)
 
@@ -163,6 +171,13 @@ def check(program: Program, engine_name: str, *, grad: bool, budget="default", r
     s = scale(values)
     if screens.overflow:
         event("skipped: a sum near overflow")
+        assume(False)
+    if screens.zero_division and program.mode != "smooth":
+        # Rounding decides whether the numerator is 0 or 1e-17, and so
+        # whether the result is NaN or an infinity: PyTorch's layer_norm of
+        # [-1, 0, 1, 0] gives 2.9e-17 where the exact answer, torch-sql's,
+        # is 0.
+        event("skipped: a division by an exact zero")
         assume(False)
     known = _known_nan(program, engine_name, values)
     if known:

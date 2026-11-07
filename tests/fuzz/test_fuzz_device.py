@@ -265,3 +265,51 @@ def test_backward_twice_accumulates(engine, program):
         ]
     for k, (a, b) in enumerate(zip(got, expected, strict=True)):
         close(a, 3 * b, max(1.0, scale([b])) * 3, f"accumulated gradient of leaf {k}")
+
+
+@pytest.mark.pinned
+@pytest.mark.parametrize(
+    "engine",
+    [
+        pytest.param(
+            "datafusion",
+            marks=pytest.mark.xfail(strict=True, reason="DataFusion's grouped MAX of -inf"),
+        ),
+        "duckdb",
+    ],
+)
+def test_amax_of_infinities(engine):
+    """On DataFusion 55, a grouped ``MAX`` over values that are all -inf is
+    ``f64::MIN`` (-1.797e308), and a grouped ``MIN`` over +inf is
+    ``f64::MAX``; without a ``GROUP BY`` they're right. torch-sql's ``amax``
+    and ``amin`` with a ``dim`` return those numbers. An attention row that
+    a mask fills with -inf meets this."""
+    import torch_sql
+
+    with torch_sql.Environment(make_engine(engine)):
+        x = torch.full((2, 3), -math.inf, dtype=torch.float64, device="sql")
+        assert x.amax(1).cpu().tolist() == [-math.inf, -math.inf]
+        assert (-x).amin(1).cpu().tolist() == [math.inf, math.inf]
+
+
+@pytest.mark.pinned
+@pytest.mark.parametrize(
+    "engine",
+    [
+        "datafusion",
+        pytest.param(
+            "duckdb",
+            marks=pytest.mark.xfail(strict=True, reason="ddx raises NotScalar on DuckDB"),
+        ),
+    ],
+)
+def test_gradient_of_a_sum_of_an_expand(engine):
+    """``w.expand(2).sum()`` is ``2 * w``. On DuckDB, ddx raises ``NotScalar:
+    the loss v does not depend on any wrt column``. Multiplying by a weight
+    first (``(w.expand(2) * c).sum()``) works."""
+    import torch_sql
+
+    with torch_sql.Environment(make_engine(engine)):
+        w = torch.tensor([-1.0], dtype=torch.float64, device="sql").requires_grad_()
+        w.expand(2).sum().backward()
+        assert w.grad.cpu().tolist() == [2.0]
