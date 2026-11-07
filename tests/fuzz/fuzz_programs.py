@@ -275,7 +275,11 @@ def run(program: Program, leaves: list[torch.Tensor], screens: Screens | None = 
         args = [values[i] for i in step.args]
         if step.op in SUMS and _real(*args) and any(_huge(a) for a in args):
             s.overflow = True
-        if step.op in ("reciprocal", "rsqrt", "div") and _real(*args) and bool((args[-1] == 0).any()):
+        if (
+            step.op in ("reciprocal", "rsqrt", "div")
+            and _real(*args)
+            and bool((args[-1] == 0).any())
+        ):
             s.zero_division = True
         values.append(OPS[step.op](s, *args, *step.params))
     return values

@@ -208,3 +208,34 @@ def test_trig_of_infinity_is_nan(fn):
         x = torch.tensor([math.inf, 1.0], dtype=torch.float64, device="sql")
         out = getattr(torch, fn)(x).cpu()
     assert torch.isnan(out[0]) and out[1] == getattr(math, fn)(1.0)
+
+
+@pytest.mark.pinned
+@pytest.mark.parametrize(
+    "engine",
+    [
+        pytest.param(
+            "datafusion",
+            marks=pytest.mark.xfail(
+                strict=True, reason="DataFusion pushes a filter below an ungrouped aggregate"
+            ),
+        ),
+        "duckdb",
+    ],
+)
+def test_select_from_stacked_scalars(engine):
+    """``torch.stack([a.sum(), b.sum()])[0]`` returns two rows on DataFusion
+    55, one of them NULL. The SQL is right; DataFusion's optimizer isn't:
+
+        SELECT * FROM (SELECT 1 AS k, SUM(v) AS s FROM t) WHERE k = 0
+
+    returns the row (1, NULL). The filter is pushed below the aggregate,
+    whose input becomes empty, and an ungrouped aggregate over no rows
+    still returns one row. ``losses[0:1]``, which joins an index table
+    instead of filtering, is right."""
+    import torch_sql
+
+    with torch_sql.Environment(make_engine(engine)):
+        a = torch.ones(3, dtype=torch.float64, device="sql")
+        losses = torch.stack([a.sum(), (2 * a).sum()])
+        assert losses[0].item() == 3.0 and losses[1].item() == 6.0

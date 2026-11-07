@@ -167,7 +167,19 @@ def run(args: list[str], timeout: int) -> tuple[bool, float]:
     start = time.monotonic()
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "pytest", "-x", "-q", "-p", "no:cacheprovider", *args],
+            # A fixed seed, so the baseline and every mutant see the same
+            # programs, and a kill is the mutant's doing.
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-x",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "--hypothesis-seed=0",
+                *args,
+            ],
             cwd=ROOT,
             capture_output=True,
             timeout=timeout,
