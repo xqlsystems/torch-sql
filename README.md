@@ -49,6 +49,9 @@ the design. What exists so far:
 - `torch_sql.index_tables`: index tables (§9.5), so far for `reshape`;
 - `torch_sql.gradients`: `backward()` through ddx (§11), so `torch.optim`
   works unchanged;
+- `torch_sql.program`: cut points, the values saved as tables so no query
+  grows past what the engine can plan, and backward passes across them
+  (§9.6);
 - `torch_sql.device.functions`: PyTorch functions torch-sql lowers before
   PyTorch decomposes them in C++ (attention, indexing with a list).
 

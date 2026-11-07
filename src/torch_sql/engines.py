@@ -36,6 +36,10 @@ class Engine:
     """The operations torch-sql needs from an engine."""
 
     name: str
+    #: The largest query, in SELECT blocks with every CTE written in at each
+    #: read, that torch-sql hands this engine before it saves values as
+    #: tables (cut points, :mod:`torch_sql.program`). None: no limit.
+    cut_budget: int | None = None
 
     def _register_ieee(self):
         """The one-row table SQL reads non-finite constants from
@@ -87,6 +91,8 @@ class DataFusionEngine(Engine):
     """Apache DataFusion, a query engine in Rust, through datafusion-python."""
 
     name = "datafusion"
+    # DataFusion plans a CTE again at every read (xarray-sql#267).
+    cut_budget = 400
 
     def __init__(self):
         from datafusion import SessionConfig, SessionContext

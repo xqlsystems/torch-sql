@@ -88,11 +88,10 @@ def test_trains_one_layer(engine):
     train(engine, layers=1, steps=3)
 
 
-def test_trains_two_layers_on_duckdb():
-    # DataFusion plans a CTE again at every read, and two layers' loss is
-    # too large to plan (xqlsystems/xarray-sql#267); the next PR's cut
-    # points fix that.
-    train("duckdb", layers=2, steps=2)
+def test_trains_two_layers(engine):
+    # Without cut points, DataFusion runs out of memory planning two layers'
+    # loss, since it plans a CTE again at every read (xarray-sql#267).
+    train(engine, layers=2, steps=2)
 
 
 def test_inference_reads_the_last_position(engine):

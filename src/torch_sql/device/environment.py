@@ -78,6 +78,9 @@ class Environment:
         self._saved: weakref.WeakValueDictionary[int, g.Table] = weakref.WeakValueDictionary()
         self._ranges: dict[int, g.Table] = {}
         self._index_tables: dict = {}
+        #: Nodes to save as tables whenever a program reads them: the inputs
+        #: of norms (decision D15). See torch_sql.program.
+        self.marked_cuts: weakref.WeakSet[g.Node] = weakref.WeakSet()
         self._mode = _FunctionMode(self)
         self._depth = 0
 
@@ -168,12 +171,12 @@ class Environment:
 
     def materialize(self, node: g.Node) -> g.Table:
         """Run ``node``'s query and save its rows as a table."""
+        from .. import program
+
         node = self.saved(node)
         if isinstance(node, g.Table):
             return node
-        table = g.Table(node.shape, node.dtype)
-        self.engine.materialize(table.name, self.query(node, key=True))
-        self._drop_with(table)
+        table = program.materialize(self, node, dict(self._saved))
         self._saved[node.id] = table
         return table
 
