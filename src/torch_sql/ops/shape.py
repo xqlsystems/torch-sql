@@ -18,7 +18,13 @@ def same(ctx, x, *args, **kwargs):
     return x
 
 
-op(aten.alias.default, aten.detach.default, aten.lift_fresh.default, aten.clone.default)(same)
+op(aten.alias.default, aten.lift_fresh.default, aten.clone.default)(same)
+
+
+@op(aten.detach.default)
+def detach(ctx, x):
+    """No gradient flows through a detached tensor (§11.3)."""
+    return g.identity(x, stop_gradient=True)
 
 
 def reindex(ctx, x: g.Node, index) -> g.Select:

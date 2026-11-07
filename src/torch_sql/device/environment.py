@@ -20,6 +20,7 @@ from __future__ import annotations
 import weakref
 
 import torch
+from torch.optim.optimizer import register_optimizer_step_post_hook
 from torch.overrides import TorchFunctionMode
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
@@ -85,12 +86,36 @@ class Environment:
 
     def __enter__(self):
         self._mode.__enter__()
+        if self._depth == 0:
+            self._hook = register_optimizer_step_post_hook(self._after_step)
         self._depth += 1
         return self
 
     def __exit__(self, *exc):
         self._depth -= 1
+        if self._depth == 0:
+            self._hook.remove()
         return self._mode.__exit__(*exc)
+
+    def _after_step(self, optimizer, args, kwargs):
+        """An optimizer step ends a training step (P2): save every parameter
+        and every piece of optimizer state as a table, so that the next
+        step's plans start from tables rather than from a graph that grows
+        with every step. State goes first, since a parameter's update reads
+        it."""
+        state = [
+            v
+            for s in optimizer.state.values()
+            for v in s.values()
+            if isinstance(v, Tensor) and v._env is self
+        ]
+        params = [
+            p
+            for group in optimizer.param_groups
+            for p in group["params"]
+            if isinstance(p, Tensor) and p._env is self
+        ]
+        self.sync(*state, *params)
 
     def enable(self):
         """Activate the environment until :meth:`disable`."""
@@ -164,6 +189,8 @@ class Environment:
         special = _SPECIAL.get(func)
         if special is not None:
             return special(self, *args, **kwargs)
+        if func._schema.name.startswith("aten::_foreach_"):
+            return _foreach(self, func, args, kwargs)
         if func._schema.is_mutable:
             return self._in_place(func, args, kwargs)
         lowering = LOWERINGS.get(func)
@@ -183,6 +210,15 @@ class Environment:
             nodes = tree_unflatten([self.empty(t.shape, t.dtype) for t in flat], spec)
         else:
             nodes = lowering(Context(func, out, self), *self._nodes(args), **self._nodes(kwargs))
+        if not torch.is_grad_enabled() and _requires_grad(args, kwargs):
+            # Computed under torch.no_grad() from a tensor that requires a
+            # gradient: a constant to the loss, as in PyTorch (§11.3).
+            nodes = tree_map(
+                lambda n: g.identity(n, stop_gradient=True)
+                if isinstance(n, g.Node) and n.dtype == torch.float64
+                else n,
+                nodes,
+            )
         return self._wrap(func, out, nodes)
 
     def empty(self, shape, dtype) -> g.Node:
@@ -304,6 +340,65 @@ class Environment:
                 value=as_dtype(g.Col(0, "v"), node.dtype, target.dtype),
             )
         target._node = node
+
+
+def _requires_grad(args, kwargs) -> bool:
+    return any(
+        isinstance(a, Tensor) and a.requires_grad
+        for a in torch.utils._pytree.tree_leaves((args, kwargs))
+    )
+
+
+#: A _foreach_ op's overload, and the plain op's overload it applies.
+_FOREACH_OVERLOADS = {
+    "List": "Tensor",
+    "ScalarList": "Scalar",
+    "Tensor": "Tensor",
+    "Scalar": "Scalar",
+    "default": "default",
+}
+
+
+def _foreach(env: Environment, func, args, kwargs):
+    """A ``_foreach_*`` op applies a plain op to each tensor of a list
+    (spike S5). One rule lowers them: call the plain op once per tensor, with
+    each list argument's element and every other argument as it is. The
+    plain op's positional parameters take the foreach op's arguments in
+    order, and its keyword-only ones take the rest (``value`` of
+    ``addcmul_``, say). ``_foreach_norm`` is ``linalg_vector_norm``."""
+    schema = func._schema
+    name = schema.name.split("::")[1][len("_foreach_") :]
+    provided = []
+    for k, a in enumerate(schema.arguments):
+        if k < len(args):
+            provided.append((a, args[k]))
+        elif a.name in kwargs:
+            provided.append((a, kwargs[a.name]))
+    lists = [v for a, v in provided if isinstance(a.type, torch._C.ListType)]
+    n = len(lists[0])
+
+    def element(a, v, i):
+        if isinstance(a.type, torch._C.ListType):
+            return v[i]
+        if a.name == "scalars" and isinstance(v, torch.Tensor):
+            return v[i].item()  # a CPU tensor of one scalar per tensor
+        return v
+
+    if name == "norm":
+        ord_ = next((v for a, v in provided if a.name == "ord"), 2)
+        return [aten.linalg_vector_norm(t, ord_) for t in provided[0][1]]
+    packet = getattr(aten, name)
+    plain = getattr(packet, _FOREACH_OVERLOADS.get(func._overloadname, func._overloadname), None)
+    plain = plain or packet.default
+    positional = [a for a in plain._schema.arguments if not a.kwarg_only]
+    keyword = [a for a in plain._schema.arguments if a.kwarg_only]
+    results = []
+    for i in range(n):
+        values = [element(a, v, i) for a, v in provided]
+        call_args = values[: len(positional)]
+        call_kwargs = {a.name: v for a, v in zip(keyword, values[len(positional) :], strict=False)}
+        results.append(plain(*call_args, **call_kwargs))
+    return None if not schema.returns else results
 
 
 def _drop(engine: Engine, name: str):

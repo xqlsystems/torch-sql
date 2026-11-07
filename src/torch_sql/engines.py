@@ -21,21 +21,30 @@ import pyarrow as pa
 @dataclass
 class Gradients:
     """What a ddx gradient program left on the engine: the loss's value, and
-    one table per ``wrt`` column, in order, each with the table's key
-    columns and the gradient under ``v``. The caller drops them
+    for each ``wrt`` table, by name, the table holding its gradient: the
+    table's key columns and the gradient under ``v``. The caller drops them
     (:meth:`Engine.drop`) once it has read them."""
 
     value: str
-    gradients: list[str]
+    gradients: dict[str, str]
 
     def tables(self) -> list[str]:
-        return [self.value, *self.gradients]
+        return [self.value, *self.gradients.values()]
 
 
 class Engine:
     """The operations torch-sql needs from an engine."""
 
     name: str
+
+    def _register_ieee(self):
+        """The one-row table SQL reads non-finite constants from
+        (:data:`torch_sql.sql.IEEE`)."""
+        from .sql import IEEE, IEEE_COLUMNS
+
+        cols = {"i": pa.array([0], pa.int64())}
+        cols.update({k: pa.array([v], pa.float64()) for k, v in IEEE_COLUMNS.items()})
+        self.register(IEEE, pa.table(cols))
 
     def register(self, name: str, table: pa.Table) -> None:
         """Register ``table`` as ``name``, replacing any table of that name."""
@@ -64,11 +73,14 @@ class Engine:
     def grad(self, loss: str, wrt: list[str]) -> Gradients:
         """Run ddx's gradient program for ``loss``, SQL that computes one row
         with one column, with respect to each ``"table.column"`` in ``wrt``:
-        one program, with one backward pass for all of them (§11.1)."""
+        one program, with one backward pass for all of them (§11.1).
+
+        The program lists its gradients in an order of its own, not ``wrt``'s,
+        so they're returned by table name."""
         backend = self.backend()
         program = ddxdb.grad_plan(backend.plan_sql(loss), wrt)
         ddxdb.run(backend, program)
-        return Gradients(program.value.step, [g.step for g in program.gradients])
+        return Gradients(program.value.step, {g.of: g.step for g in program.gradients})
 
 
 class DataFusionEngine(Engine):
@@ -84,6 +96,7 @@ class DataFusionEngine(Engine):
         self.ctx = SessionContext(SessionConfig().with_information_schema(True))
         register_stop_gradient(self.ctx)
         self._backend = DataFusionBackend(self.ctx)
+        self._register_ieee()
 
     def register(self, name, table):
         self.ctx.deregister_table(name)
@@ -121,6 +134,7 @@ class DuckDBEngine(Engine):
         self._backend = DuckDBBackend(self.con)
         # Registered Arrow tables, kept alive as long as they're registered.
         self._arrow: dict[str, pa.Table] = {}
+        self._register_ieee()
 
     def register(self, name, table):
         self.drop(name)

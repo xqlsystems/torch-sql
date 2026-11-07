@@ -46,7 +46,9 @@ the design. What exists so far:
 - `torch_sql.device`: `device="sql"`, `torch_sql.Tensor` and the
   `Environment` that records ops (§9.1);
 - `torch_sql.ops`: the op table (§9.3);
-- `torch_sql.index_tables`: index tables (§9.5), so far for `reshape`.
+- `torch_sql.index_tables`: index tables (§9.5), so far for `reshape`;
+- `torch_sql.gradients`: `backward()` through ddx (§11), so `torch.optim`
+  works unchanged.
 
 ```python
 import torch, torch_sql

@@ -94,9 +94,6 @@ class Expr:
     def __rtruediv__(self, o):
         return Call("/", (lit(o), self))
 
-    def __neg__(self):
-        return Call("neg", (self,))
-
 
 @dataclass(frozen=True, slots=True)
 class Col(Expr):
@@ -232,6 +229,10 @@ class Select(Node):
     - ``group``: whether the block groups by its index expressions; its
       ``value`` then contains an :class:`Agg`. A grouping block with no index
       expressions aggregates every row into one.
+    - ``stop_gradient``: no gradient flows through this node, as with
+      ``x.detach()``. It doesn't change the SQL; before ddx differentiates a
+      loss, torch-sql saves every such node as a table, which ddx treats as
+      a constant (:mod:`torch_sql.gradients`).
     """
 
     on: tuple[tuple[Expr, Expr], ...] = ()
@@ -239,6 +240,7 @@ class Select(Node):
     index: tuple[Expr, ...] = ()
     value: Expr | None = None
     group: bool = False
+    stop_gradient: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -273,6 +275,18 @@ class UnionAll(Node):
         for n in self.inputs:
             if n.rank != self.rank or n.dtype != self.dtype:
                 raise ValueError("a UNION ALL's inputs must have its rank and dtype")
+
+
+def identity(x: Node, *, stop_gradient: bool = False) -> Select:
+    """A projection of ``x`` that changes nothing."""
+    return Select(
+        x.shape,
+        x.dtype,
+        (x,),
+        index=tuple(Col(0, c) for c in x.columns),
+        value=Col(0, "v"),
+        stop_gradient=stop_gradient,
+    )
 
 
 def topological(roots, resolve=lambda n: n) -> list[Node]:
