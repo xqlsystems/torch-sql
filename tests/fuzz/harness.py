@@ -30,7 +30,7 @@ def weights(shape) -> torch.Tensor:
     return torch.cos(torch.arange(n, dtype=F64) * 0.7 + 0.3).reshape(shape)
 
 
-def close(got: torch.Tensor, expected: torch.Tensor, scale_: float, what: str):
+def close(got: torch.Tensor, expected: torch.Tensor, scale_: float, what: str, *, inf_sign=True):
     got = got.detach().to(F64)
     expected = expected.detach().to(F64)
     assert got.shape == expected.shape, (
@@ -42,7 +42,10 @@ def close(got: torch.Tensor, expected: torch.Tensor, scale_: float, what: str):
         f"got      {got.tolist()}\nexpected {expected.tolist()}"
     )
     inf_exp = torch.isinf(expected)
-    assert torch.equal(got[inf_exp], expected[inf_exp]), (
+    a, b = got[inf_exp], expected[inf_exp]
+    if not inf_sign:
+        a, b = a.abs(), b.abs()
+    assert torch.equal(a, b), (
         f"{what}: infinities differ\ngot      {got.tolist()}\nexpected {expected.tolist()}"
     )
     finite = ~(nan_exp | inf_exp)
@@ -176,7 +179,7 @@ def check(program: Program, engine_name: str, *, grad: bool, budget="default", r
         got, grads = on_device(
             program, make_engine(engine_name, budget), grad=grad, read=read, requires=requires
         )
-    close(got, out, s, "value")
+    close(got, out, s, "value", inf_sign=not screens.zero_division)
     event("gradient compared" if grad else "value only")
     if grad:
         gs = scale([*expected_grads, *values])

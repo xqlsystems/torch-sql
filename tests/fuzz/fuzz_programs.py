@@ -73,6 +73,10 @@ class Screens:
         #: A sum met values near overflow, where the order of the terms
         #: decides between a finite result, an infinity and a NaN.
         self.overflow = False
+        #: A division by an exact zero. The infinity's sign is then the
+        #: zero's, and a sum's zero has a sign its kernel chooses: PyTorch's
+        #: own sum of [-0.0] is +0.0, its matrix product's -0.0.
+        self.zero_division = False
 
 
 def _real(*xs) -> bool:
@@ -271,6 +275,8 @@ def run(program: Program, leaves: list[torch.Tensor], screens: Screens | None = 
         args = [values[i] for i in step.args]
         if step.op in SUMS and _real(*args) and any(_huge(a) for a in args):
             s.overflow = True
+        if step.op in ("reciprocal", "rsqrt", "div") and _real(*args) and bool((args[-1] == 0).any()):
+            s.zero_division = True
         values.append(OPS[step.op](s, *args, *step.params))
     return values
 
