@@ -49,8 +49,8 @@ def test_grad_of_a_hand_built_loss(engine):
     value = torch.tensor(
         engine.query(f"SELECT v FROM {out.value}").column("v")[0].as_py(), dtype=F64
     )
-    gw = to_dense(engine.query(f"SELECT * FROM {out.gradients[0]}"), w.shape, F64)
-    gb = engine.query(f"SELECT * FROM {out.gradients[1]}")
+    gw = to_dense(engine.query(f"SELECT * FROM {out.gradients[tw.name]}"), w.shape, F64)
+    gb = engine.query(f"SELECT * FROM {out.gradients[tb.name]}")
     for name in out.tables():
         engine.drop(name)
 

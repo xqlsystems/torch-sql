@@ -146,9 +146,16 @@ def div(ctx, a, b):
     return binary(ctx, a, b, lambda x, y: x / y)
 
 
+def negate(v: g.Expr, dtype: torch.dtype) -> g.Expr:
+    """``-v`` as ``-1 * v``: exact, it keeps ``-0.0`` (``0 - v`` wouldn't),
+    and ddx differentiates it on DuckDB, whose plans write unary minus as a
+    one-argument subtract (xqlsystems/ddx#262)."""
+    return scalar(-1, dtype) * v
+
+
 @op(aten.neg.default)
 def neg(ctx, x):
-    return unary(ctx, x, lambda v: -v)
+    return unary(ctx, x, lambda v: negate(v, ctx.out.dtype))
 
 
 @op(aten.reciprocal.default)
@@ -224,7 +231,7 @@ def tanh(ctx, x):
 @op(aten.sigmoid.default)
 def sigmoid(ctx, x):
     one = scalar(1.0, ctx.out.dtype)
-    return unary(ctx, x, lambda v: one / (one + g.call("exp", -v)))
+    return unary(ctx, x, lambda v: one / (one + g.call("exp", negate(v, ctx.out.dtype))))
 
 
 @op(aten.abs.default)

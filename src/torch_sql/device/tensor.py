@@ -39,6 +39,9 @@ class Tensor(torch.Tensor):
             requires_grad=requires_grad,
         )
         t._node, t._env = node, env
+        #: The table holding the value of a tensor that keeps its graph
+        #: (see Environment.sync).
+        t._table = None
         return t
 
     @classmethod
@@ -72,6 +75,13 @@ class Tensor(torch.Tensor):
     def __repr__(self, *, tensor_contents=None):
         body = repr(self.detach().cpu())
         return f"{body[:-1]}, device='sql')" if body.endswith(")") else body
+
+    def backward(self, gradient=None, retain_graph=None, create_graph=False, inputs=None):
+        """ddx computes the gradients, not PyTorch's autograd (§11.1); see
+        :func:`torch_sql.gradients.backward`."""
+        from ..gradients import backward
+
+        backward(self, gradient, retain_graph, create_graph, inputs)
 
     def __reduce_ex__(self, protocol):
         raise TypeError("a torch-sql tensor can't be pickled yet; move it to the CPU first")
