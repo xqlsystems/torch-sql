@@ -1,7 +1,6 @@
 """Ops that create tensors (design §8.7), and casts.
 
-A constant tensor is a cross join of ranges, one per dimension, with the
-value as a literal, so its size never reaches the SQL text. Random tensors
+A constant tensor is a registered table (see :func:`filled`). Random tensors
 are drawn on the CPU, with PyTorch's CPU generator, and registered: the
 same seed gives the same numbers as PyTorch on the CPU.
 """
@@ -12,24 +11,17 @@ import torch
 
 from .. import graph as g
 from . import op
-from ._build import as_dtype, scalar
+from ._build import as_dtype
 
 aten = torch.ops.aten
 
 
 def filled(env, shape, dtype, value) -> g.Node:
-    """A tensor of ``shape`` whose every element is ``value``."""
-    shape = tuple(shape)
-    if not shape:
-        return g.Values((), dtype, rows=((scalar(value, dtype).value,),))
-    ranges = tuple(env.arange(n) for n in shape)
-    return g.Select(
-        shape,
-        dtype,
-        ranges,
-        index=tuple(g.Col(k, "i0") for k in range(len(shape))),
-        value=scalar(value, dtype),
-    )
+    """A tensor of ``shape`` whose every element is ``value``, as a
+    registered table. A ``SELECT`` of a constant from a range table would
+    say the same in SQL, but ddx's DuckDB backend reads such a constant
+    column wrongly, without an error (xqlsystems/ddx#265)."""
+    return env.upload(torch.full(tuple(shape), value, dtype=dtype))
 
 
 @op(aten.full_like.default)

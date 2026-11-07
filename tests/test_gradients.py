@@ -330,3 +330,64 @@ def _near_kink(sample) -> bool:
         return True
     s = v.sort().values
     return bool((s[1:] - s[:-1]).abs().min() < 1e-6) if s.numel() > 1 else False
+
+
+# -- Found in review ----------------------------------------------------------
+
+
+def test_copy_under_no_grad_is_a_constant(env):
+    p = torch.tensor([1.0, 2.0], dtype=F64, device="sql", requires_grad=True)
+    q = torch.zeros(2, dtype=F64, device="sql", requires_grad=True)
+    with torch.no_grad():
+        q.copy_(p)
+    (p * q).sum().backward()
+    close(p.grad, torch.tensor([1.0, 2.0], dtype=F64))
+    close(q.grad, torch.tensor([1.0, 2.0], dtype=F64))
+
+
+def test_load_state_dict_between_models_keeps_their_gradients_apart(env):
+    # A target network loaded from another, as in EMA or DQN.
+    a, b = mlp().to("sql"), mlp().to("sql")
+    b.load_state_dict(a.state_dict())
+    x = torch.randn(4, 3, dtype=F64)
+    ref = mlp()
+    ref_loss = (ref(x) * ref(x).detach()).sum()
+    ref_loss.backward()
+    (a(x.to("sql")) * b(x.to("sql"))).sum().backward()
+    for p, q, r in zip(a.parameters(), b.parameters(), ref.parameters(), strict=True):
+        close(p.grad, r.grad)
+        close(q.grad, r.grad)
+
+
+def test_clones_are_separate_leaves(env):
+    x = torch.randn(3, dtype=F64, device="sql")
+    a, b = x.clone().requires_grad_(), x.clone().requires_grad_()
+    (a * 2 + b * 3).sum().backward()
+    close(a.grad, torch.full((3,), 2.0, dtype=F64))
+    close(b.grad, torch.full((3,), 3.0, dtype=F64))
+
+
+def test_backward_under_no_grad(env):
+    p = torch.tensor([1.0, 2.0], dtype=F64, device="sql", requires_grad=True)
+    loss = (p * p).sum()
+    with torch.no_grad():
+        loss.backward()
+    close(p.grad, torch.tensor([2.0, 4.0], dtype=F64))
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        lambda s: s.detach(),
+        lambda s: torch.tensor(2.0, dtype=F64, device="sql"),
+        lambda s: torch.full_like(s, 2.0),
+    ],
+    ids=["detached", "constant", "full_like"],
+)
+def test_scalar_losses_with_scalar_operands(env, other):
+    # d(s * o)/ds = o, with o a constant.
+    s = torch.tensor(3.0, dtype=F64, device="sql", requires_grad=True)
+    o = other(s)
+    expected = o.detach().cpu().item()
+    (s * o).backward()
+    torch.testing.assert_close(s.grad.cpu().item(), expected)
