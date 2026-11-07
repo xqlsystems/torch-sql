@@ -28,6 +28,7 @@ import weakref
 import torch
 
 from . import graph as g
+from . import sql
 
 
 def leaves(loss: torch.Tensor) -> list[torch.Tensor]:
@@ -80,33 +81,44 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
     if not targets:
         return
 
-    # Each leaf as a table, which ddx differentiates with respect to.
-    tables = []
+    # Each leaf as a table, which ddx differentiates with respect to. The
+    # loss's graph refers to each leaf's node from before the sync.
+    tables, resolve = [], {}
     for t in targets:
+        node = t._node
         env.sync(t)
         tables.append(t._node)
+        resolve[node.id] = t._node
     # Each stop-gradient node as a table, which ddx treats as a constant.
-    # The environment keeps saved tables only while something refers to
-    # them, so `held` keeps these until the gradients exist.
-    held = [
-        env.materialize(node)
-        for node in g.topological([objective._node], env.saved)
-        if isinstance(node, g.Select) and node.stop_gradient
-    ]
+    # Every other node is computed again, so that ddx differentiates it,
+    # even if its value was read before and is saved.
+    stack, seen = [objective._node], set()
+    while stack:
+        node = stack.pop()
+        if node.id in seen or node.id in resolve:
+            continue
+        seen.add(node.id)
+        if isinstance(node, g.Select) and node.stop_gradient:
+            resolve[node.id] = env.materialize(node)
+        else:
+            stack.extend(node.inputs)
 
-    root = env.saved(objective._node)
-    reached = {n.id for n in g.topological([root], env.saved) if isinstance(n, g.Table)}
+    def read(node):
+        return resolve.get(node.id, node)
+
+    reached = {n.id for n in g.topological([objective._node], read) if isinstance(n, g.Table)}
     wrt = [table for table in tables if table.id in reached]
     grads = {}
     if wrt:
-        out = env.engine.grad(env.query(objective._node), [f"{t.name}.v" for t in wrt])
+        loss_sql = sql.query(objective._node, resolve)
+        out = env.engine.grad(loss_sql, [f"{t.name}.v" for t in wrt])
         # The program computed the loss too: reading it costs no query of
         # the forward pass.
         value = _adopt(env, g.Table((), objective.dtype, name=out.value))
         env._saved[objective._node.id] = value
-        objective._node = value
-        if loss._node is not value and env.saved(loss._node) is value:
-            loss._node = value
+        objective._table = value
+        if loss._node is objective._node:
+            loss._table = value
         for table in wrt:
             name = out.gradients[table.name]
             grads[table.id] = _adopt(env, g.Table(table.shape, table.dtype, name=name))
@@ -118,7 +130,6 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
             grad = Tensor(node, env)
         with torch.no_grad():
             t.grad = grad if t.grad is None else t.grad + grad
-    del held
 
 
 def _adopt(env, table: g.Table) -> g.Table:

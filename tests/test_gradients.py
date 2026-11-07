@@ -96,6 +96,20 @@ def test_loss_value_comes_with_the_gradients(env, monkeypatch):
     assert len(queries) == 1 and "__ddx_" in queries[0]
 
 
+def test_reading_the_loss_first_keeps_its_gradient(env):
+    # Reading a value saves it as a table; a tensor with a history keeps the
+    # history too, or backward() would see a table, a constant.
+    wc = torch.randn(3, dtype=F64, requires_grad=True)
+    (wc * wc).sum().backward()
+    w = wc.detach().to("sql").requires_grad_()
+    hidden = w * w
+    hidden.cpu()
+    loss = hidden.sum()
+    loss.item()
+    loss.backward()
+    close(w.grad, wc.grad)
+
+
 def test_gradients_accumulate(env):
     w = torch.randn(3, dtype=F64, device="sql", requires_grad=True)
     (w * w).sum().backward()

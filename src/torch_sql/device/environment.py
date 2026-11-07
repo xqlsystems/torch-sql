@@ -170,14 +170,27 @@ class Environment:
 
     def sync(self, *tensors: Tensor) -> None:
         """Run what each tensor's value depends on, and keep it as a table
-        (§9.6). Later ops on these tensors read the tables."""
+        (§9.6). Later queries read the table.
+
+        A leaf (a tensor with no ``grad_fn``: a parameter, optimizer state,
+        an input) then *is* its table: its history is no one's business.
+        Any other tensor keeps its graph as well, since a later
+        ``backward()`` must differentiate through it."""
         for t in tensors:
-            t._node = self.materialize(t._node)
+            table = self.materialize(t._node)
+            if t.grad_fn is None:
+                t._node = table
+            else:
+                t._table = table
+
+    def table_of(self, t: Tensor) -> g.Table:
+        """The table holding ``t``'s value, once synced."""
+        return t._node if isinstance(t._node, g.Table) else t._table
 
     def read(self, t: Tensor) -> torch.Tensor:
         """``t``'s value as a CPU tensor."""
         self.sync(t)
-        node = t._node
+        node = self.table_of(t)
         rows = self.engine.query(f"SELECT {', '.join((*node.columns, 'v'))} FROM {node.name}")
         return to_dense(rows, node.shape, node.dtype)
 

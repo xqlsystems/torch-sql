@@ -38,6 +38,9 @@ class Tensor(torch.Tensor):
             requires_grad=requires_grad,
         )
         t._node, t._env = node, env
+        #: The table holding the value of a tensor that keeps its graph
+        #: (see Environment.sync).
+        t._table = None
         return t
 
     @classmethod
