@@ -292,3 +292,18 @@ def test_integer_sum_stays_integer(env):
     y = x.to("sql").sum(1)
     assert y.dtype == torch.int64
     assert torch.equal(y.cpu(), x.sum(1))
+
+
+def test_integer_tensor_against_a_float(env):
+    x = torch.tensor([1, 2, 3])
+    same(x.to("sql") < 1.5, x < 1.5)
+    same(x.to("sql") == 2.0, x == 2.0)
+
+
+def test_bitwise_of_integers_is_refused(env):
+    with pytest.raises(NotImplementedError, match="integers"):
+        torch.tensor([3], device="sql") & torch.tensor([5], device="sql")
+    same(
+        torch.tensor([True, False], device="sql") & torch.tensor([True, True], device="sql"),
+        torch.tensor([True, False]),
+    )

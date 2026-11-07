@@ -93,7 +93,11 @@ def compare(cmp: str, a: g.Expr, b: g.Expr, floating: bool) -> g.Expr:
 
 
 def comparison_dtype(ctx: Context, a, b) -> torch.dtype:
-    """The dtype PyTorch compares ``a`` and ``b`` in."""
+    """The dtype PyTorch compares ``a`` and ``b`` in. For an integer tensor
+    against a Python float, PyTorch compares in the default float dtype,
+    float32; torch-sql compares in float64, which it supports, and which
+    agrees with float32 except for integers beyond 2**24 that float32 can't
+    tell apart."""
 
     def meta(x):
         if isinstance(x, g.Node):
@@ -101,7 +105,8 @@ def comparison_dtype(ctx: Context, a, b) -> torch.dtype:
         return x
 
     with torch._C.DisableTorchFunction():
-        return torch.result_type(meta(a), meta(b))
+        dtype = torch.result_type(meta(a), meta(b))
+    return torch.float64 if dtype.is_floating_point else dtype
 
 
 # ----------------------------------------------------------------------------
@@ -375,6 +380,9 @@ def _truth(e, dtype):
 
 def _logical(fn_name):
     def lower(ctx, a, b):
+        if ctx.out.dtype != torch.bool:  # bitwise_and or bitwise_or of integers
+            raise NotImplementedError(f"{ctx.func} of integers")
+
         def fn(x, y):
             return g.call(fn_name, _truth(x, dtype_of(a)), _truth(y, dtype_of(b)))
 
