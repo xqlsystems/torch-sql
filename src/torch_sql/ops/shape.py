@@ -119,20 +119,7 @@ def slice_(ctx, x, dim=0, start=None, end=None, step=1):
     start, end, _ = slice(start, end, step).indices(n)
     if step != 1:
         raise NotImplementedError("a slice with a step")
-    if (start, end) == (0, n):
-        return x
-    i = g.Col(0, f"i{dim}")
-    out = ctx.out
-    index = [g.Col(0, c) for c in x.columns]
-    index[dim] = i - start if start else i
-    return g.Select(
-        tuple(out.shape),
-        out.dtype,
-        (x,),
-        where=g.call("and", g.call(">=", i, start), g.call("<", i, end)),
-        index=tuple(index),
-        value=g.Col(0, "v"),
-    )
+    return _slice(ctx.env, x, dim, start, end, tuple(ctx.out.shape), ctx.out.dtype)
 
 
 @op(aten.cat.default)
@@ -161,3 +148,44 @@ def cat(ctx, tensors, dim=0):
         )
         offset += t.shape[dim]
     return parts[0] if len(parts) == 1 else g.UnionAll(shape, out.dtype, tuple(parts))
+
+
+@op(aten.split_with_sizes.default)
+def split_with_sizes(ctx, x, split_sizes, dim=0):
+    """A slice for each part."""
+    dim = dim % x.rank
+    parts, start = [], 0
+    for meta, size in zip(ctx.out, split_sizes, strict=True):
+        part = _slice(ctx.env, x, dim, start, start + size, tuple(meta.shape), meta.dtype)
+        parts.append(part)
+        start += size
+    return parts
+
+
+@op(aten.split.Tensor)
+def split(ctx, x, split_size, dim=0):
+    dim = dim % x.rank
+    sizes = [meta.shape[dim] for meta in ctx.out]
+    return split_with_sizes(ctx, x, sizes, dim)
+
+
+def _slice(env, x, dim, start, end, shape, dtype) -> g.Node:
+    """Positions ``start .. end - 1`` along ``dim``: a join with an index
+    table (:func:`torch_sql.index_tables.slice_table`). A range filter would
+    do, but DuckDB rewrites one into ``BETWEEN``, which ddx can't write back
+    as SQL on DuckDB."""
+    from ..index_tables import slice_table
+
+    if (start, end) == (0, x.shape[dim]):
+        return x
+    table = slice_table(env, start, end)
+    index = [g.Col(0, c) for c in x.columns]
+    index[dim] = g.Col(1, "b0")
+    return g.Select(
+        shape,
+        dtype,
+        (x, table),
+        on=((g.Col(0, f"i{dim}"), g.Col(1, "a0")),),
+        index=tuple(index),
+        value=g.Col(0, "v"),
+    )

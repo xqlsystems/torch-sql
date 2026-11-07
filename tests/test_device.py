@@ -292,3 +292,20 @@ def test_integer_sum_stays_integer(env):
     y = x.to("sql").sum(1)
     assert y.dtype == torch.int64
     assert torch.equal(y.cpu(), x.sum(1))
+
+
+def test_dropout_draws_as_the_cpu_does(env):
+    x = torch.randn(4, 5, dtype=F64)
+    torch.manual_seed(3)
+    expected = torch.nn.functional.dropout(x, 0.3, training=True)
+    torch.manual_seed(3)
+    same(torch.nn.functional.dropout(x.to("sql"), 0.3, training=True), expected)
+
+
+def test_index_with_a_list(env):
+    x = torch.randn(2, 4, 3, dtype=F64)
+    same(x.to("sql")[:, [-1], :], x[:, [-1], :])
+    same(x.to("sql")[:, [0, 2]], x[:, [0, 2]])
+    same(x.to("sql")[torch.tensor([1, 0])], x[torch.tensor([1, 0])])
+    with pytest.raises(NotImplementedError, match="boolean mask|nonzero"):
+        x.to("sql")[x.to("sql") > 0]

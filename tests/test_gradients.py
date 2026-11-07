@@ -15,6 +15,17 @@ GRAD_REFUSED = {
     "div": "rounding_mode",
     "pow": "ddx differentiates power(x, y) only when x or y is a constant",
     "nn.functional.linear": "a 1-d input, which PyTorch's matmul squeezes in place",
+    "nn.functional.gelu": "exact GELU needs erf (xqlsystems/ddx#256)",
+    "nn.functional.embedding": "padding_idx, max_norm or scale_grad_by_freq",
+    "nn.functional.cross_entropy": "class weights or label smoothing",
+    "nn.functional.scaled_dot_product_attention": "enable_gqa",
+}
+
+#: (op, engine, a phrase of the error): refusals of one engine only, each a
+#: ddx issue.
+ENGINE_REFUSED = {
+    # A 0-d input's gather is a CTE reading only a one-row table's value.
+    ("gather", "duckdb", "does not depend on any wrt column"): "xqlsystems/ddx#264",
 }
 
 
@@ -217,6 +228,18 @@ DIFFERENTIABLE = [
     "maximum",
     "minimum",
     "amin",
+    # nanoGPT's ops
+    "nn.functional.embedding",
+    "nn.functional.layer_norm",
+    "softmax",
+    "log_softmax",
+    "nn.functional.cross_entropy",
+    "gather",
+    "masked_fill",
+    "split",
+    "split_with_sizes",
+    "nn.functional.scaled_dot_product_attention",
+    "nn.functional.gelu",
 ]
 
 
@@ -239,6 +262,8 @@ def test_op_gradient(engine, info):
             if isinstance(t, torch.Tensor)
         ]
         if any(t.dtype not in (F64, torch.int64, torch.bool) for t in tensors):
+            continue
+        if sample.kwargs.get("dropout_p"):  # random, so it can't match PyTorch
             continue
         leaves = [
             t
@@ -288,7 +313,10 @@ def test_op_gradient(engine, info):
                 )
                 objective.backward()
         except (NotImplementedError, ddxdb.DdxError) as e:
-            assert info.name in GRAD_REFUSED, f"{sample}: {e}"
+            known = [
+                k for k in ENGINE_REFUSED if k[:2] == (info.name, engine.name) and k[2] in str(e)
+            ]
+            assert info.name in GRAD_REFUSED or known, f"{sample}: {e}"
             refused += 1
             continue
         for t, e in zip(leaves, expected, strict=True):

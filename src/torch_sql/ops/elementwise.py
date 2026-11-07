@@ -302,6 +302,12 @@ def where(ctx, cond, a, b):
     return elementwise(shape, dtype, [cond, a, b], case, compute=[torch.bool, dtype, dtype])
 
 
+@op(aten.masked_fill.Scalar, aten.masked_fill.Tensor)
+def masked_fill(ctx, x, mask, value):
+    shape, dtype = out_of(ctx)
+    return elementwise(shape, dtype, [mask, value, x], case, compute=[torch.bool, dtype, dtype])
+
+
 @op(aten.maximum.default)
 def maximum(ctx, a, b):
     # a >= b is true when a is NaN, since SQL orders NaN above every number,
