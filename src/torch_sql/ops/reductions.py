@@ -22,7 +22,7 @@ import torch
 
 from .. import graph as g
 from ..sql import cast_to
-from . import op
+from . import Context, op
 from ._build import as_dtype, normalize_dims
 
 aten = torch.ops.aten
@@ -89,6 +89,69 @@ def amin(ctx, x, dim=(), keepdim=False):
     return g.Select(
         m.shape, m.dtype, (m,), index=tuple(g.Col(0, c) for c in m.columns), value=-g.Col(0, "v")
     )
+
+
+def _arg_extremum(ctx, x, dim, keepdim, extremum, shape):
+    """``argmax`` or ``argmin`` along ``dim`` (all of ``x`` when None,
+    giving the index into its flattened form): the extremum, joined back to
+    ``x`` on the kept dimensions, and the least index whose value equals
+    it, since PyTorch gives the first. A NaN is the extremum, as in
+    ``amax``. The result has ``shape``."""
+    dims = tuple(range(x.rank)) if dim is None else (dim % max(x.rank, 1),)
+    dims = tuple(d for d in dims if d < x.rank)
+    kept = [d for d in range(x.rank) if d not in dims]
+    meta = torch.empty([x.shape[d] for d in kept], dtype=x.dtype, device="meta")
+    m = extremum(Context(ctx.func, meta, ctx.env), x, dims, False)
+    v, best = g.Col(0, "v"), g.Col(1, "v")
+    hit = g.call("=", v, best)
+    if x.dtype == torch.float64:
+        hit = g.call("or", hit, g.call("and", g.call("isnan", v), g.call("isnan", best)))
+    flat, stride = g.Lit(0, torch.int64), 1
+    for d in reversed(dims):
+        flat = g.call("+", flat, g.call("*", g.Col(0, f"i{d}"), g.Lit(stride, torch.int64)))
+        stride *= x.shape[d]
+    index = []
+    for d in range(x.rank):
+        if d in kept:
+            index.append(g.Col(0, f"i{d}"))
+        elif keepdim and dim is not None:
+            index.append(g.Lit(0, torch.int64))
+    if keepdim and dim is None:
+        index = [g.Lit(0, torch.int64)] * x.rank
+    return g.Select(
+        tuple(shape),
+        torch.int64,
+        (x, m),
+        on=tuple((g.Col(0, f"i{d}"), g.Col(1, f"i{k}")) for k, d in enumerate(kept)),
+        where=hit,
+        index=tuple(index),
+        value=g.Agg("MIN", flat),
+        group=True,
+    )
+
+
+@op(aten.argmax.default)
+def argmax(ctx, x, dim=None, keepdim=False):
+    return _arg_extremum(ctx, x, dim, keepdim, amax, ctx.out.shape)
+
+
+@op(aten.argmin.default)
+def argmin(ctx, x, dim=None, keepdim=False):
+    return _arg_extremum(ctx, x, dim, keepdim, amin, ctx.out.shape)
+
+
+@op(aten.max.dim)
+def max_dim(ctx, x, dim, keepdim=False):
+    values, indices = ctx.out
+    meta = Context(ctx.func, values, ctx.env)
+    return amax(meta, x, (dim,), keepdim), _arg_extremum(ctx, x, dim, keepdim, amax, indices.shape)
+
+
+@op(aten.min.dim)
+def min_dim(ctx, x, dim, keepdim=False):
+    values, indices = ctx.out
+    meta = Context(ctx.func, values, ctx.env)
+    return amin(meta, x, (dim,), keepdim), _arg_extremum(ctx, x, dim, keepdim, amin, indices.shape)
 
 
 def _truth_reduce(ctx, x, dim, keepdim, agg):

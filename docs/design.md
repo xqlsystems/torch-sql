@@ -808,7 +808,10 @@ index columns.
 
 An in-place op such as `fts += skip` replaces the tensor's graph node with a
 new one; the old value stays available to anything that already read it.
-This is how torchax handles in-place ops too.
+This is how torchax handles in-place ops too. An op with `out=`
+(`torch.maximum(a, b, out=a)`, which `Adam(amsgrad=True)` calls) is the
+same: the op without `out=`, whose result replaces `out`'s node. PyTorch
+resizes an `out=` of another shape; torch-sql refuses it.
 
 A view (`x[:2]`, `x.view(2, 2)`, `x.t()`) and `x.detach()` share their
 base's storage in PyTorch, so they must see an in-place op on it. In
