@@ -161,12 +161,14 @@ def check(program: Program, engine_name: str, *, grad: bool, budget="default", r
     if screens.overflow:
         event("skipped: a sum near overflow")
         assume(False)
-    if screens.zero_division and program.mode != "smooth":
+    if screens.zero_division:
         # Rounding decides whether the numerator is 0 or 1e-17, and so
         # whether the result is NaN or an infinity: PyTorch's layer_norm of
         # [-1, 0, 1, 0] gives 2.9e-17 where the exact answer, torch-sql's,
-        # is 0.
-        event("skipped: a division by an exact zero")
+        # is 0. A zero can come from cancellation in any mode: the log of
+        # layer_norm of a constant row is -inf on PyTorch, and -35 after a
+        # residue of 5e-16 from another summation order.
+        event("skipped: a division by an exact zero, or its log")
         assume(False)
     known = _known_nan(program, engine_name, values)
     if known:
