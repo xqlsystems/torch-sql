@@ -12,8 +12,6 @@ loss over all of them. A write through a view may be refused (P3).
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 from harness import close, make_engine, refusals_are_skips, scale, weights
@@ -119,40 +117,6 @@ def interpret(program, device):
     return tensors, leaves
 
 
-def known(program) -> str | None:
-    """A finding already reported, which a soak should look past. Set
-    ``TORCH_SQL_FUZZ_KNOWN=0`` to see them again."""
-    if os.environ.get("TORCH_SQL_FUZZ_KNOWN", "1") == "0":
-        return None
-    actions, _ = program
-    root = [0, 1]  # the tensor whose storage each tensor shares
-    depth = [0, 0]  # how many aliases each tensor is from its root
-    tracked = [True, True]  # whether autograd sees a write to it
-    history = [False, True]  # whether its root has a grad_fn
-    used = set()  # roots that another tensor was computed from
-    for action in actions:
-        k = action[2]
-        if action[0] == "alias":
-            root.append(root[k])
-            depth.append(depth[k] + 1)
-            tracked.append(tracked[k] and action[1] not in ("detach", "data"))
-            history.append(history[k])
-        elif action[0] == "compute":
-            used.add(root[k])
-            root.append(len(root))
-            depth.append(0)
-            tracked.append(True)
-            history.append(True)
-        else:
-            if root[k] == 0 and 0 in used:
-                return "a leaf written after it was used loses those uses' gradients"
-            if history[k] and (action[3] or not tracked[k]):
-                return "a write autograd doesn't record erases the tensor's history"
-            if any(d >= 2 for r, d in zip(root, depth, strict=True) if r == root[k]):
-                return "a view of an alias derives its base's node again"
-    return None
-
-
 def loss_of(tensors):
     return sum(
         (t * weights(t.shape).to(t.device if t.device.type == "cpu" else "sql")).sum()
@@ -165,10 +129,6 @@ def loss_of(tensors):
 @given(program=alias_programs())
 def test_aliases_match_pytorch(engine, program):
     note(repr(program[0]))
-    why = known(program)
-    if why:
-        event(f"known finding: {why}")
-        assume(False)
     try:
         tensors, leaves = interpret(program, "cpu")
         values = [t.detach().clone() for t in tensors]
@@ -205,8 +165,8 @@ def test_aliases_match_pytorch(engine, program):
 
 
 # -- Pinned findings ---------------------------------------------------------
-# Each was found by the property above and shrunk by hand. Each is a strict
-# xfail: it passes once the bug is fixed, then fails until the marker goes.
+# Each was found by the property above and shrunk by hand. Fixed ones stay
+# as regression tests.
 
 
 def _gradient(engine, program):
@@ -228,15 +188,15 @@ def _leaf(device):
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="a write autograd doesn't record erases the history")
 @pytest.mark.parametrize("engine", sorted(engines.ENGINES))
 @pytest.mark.parametrize("how", ["no_grad", "detach"])
 def test_untracked_write_keeps_history(engine, how):
     """An in-place op autograd doesn't record, under ``torch.no_grad()`` or
     through ``.detach()``, changes a tensor's value but not its gradient: in
     PyTorch, ``y`` below still has ``MulBackward``, and ``w.grad`` is 2.
-    torch-sql gives ``y`` the write's node, which is cut from ``y``'s history
-    (a stop-gradient), so ``w.grad`` is 0."""
+    torch-sql gave ``y`` the write's node, which is cut from ``y``'s history
+    (a stop-gradient), so ``w.grad`` was 0. It's refused for now
+    (xqlsystems/torch-sql#18); when it's supported, drop the ``raises``."""
 
     def program(device):
         w = _leaf(device)
@@ -248,20 +208,19 @@ def test_untracked_write_keeps_history(engine, how):
             y.detach().add_(1)
         return w, y.sum()
 
-    got, expected = _gradient(engine, program)
-    assert torch.equal(got, expected), f"got {got.tolist()}, PyTorch {expected.tolist()}"
+    with pytest.raises(NotImplementedError, match="autograd doesn't record"):
+        _gradient(engine, program)
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="a leaf written after use loses those uses' gradients")
 @pytest.mark.parametrize("engine", sorted(engines.ENGINES))
 def test_leaf_written_after_use(engine):
     """``c = w * 2`` reads the leaf's node before the write; backward()
     differentiates with respect to the leaf's node after it, so the gradient
     through ``c`` is lost: 1 where PyTorch gives 3. Had ``c`` saved ``w``
     (``c = w * w``), PyTorch would raise "one of the variables needed for
-    gradient computation has been modified by an inplace operation";
-    torch-sql gives 1 there too, with no error."""
+    gradient computation has been modified by an inplace operation", and
+    so does torch-sql now."""
 
     def program(device):
         w = _leaf(device)
@@ -275,7 +234,6 @@ def test_leaf_written_after_use(engine):
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="a view of an alias derives its base's node again")
 @pytest.mark.parametrize("engine", sorted(engines.ENGINES))
 def test_view_of_a_parameter_after_a_write(engine):
     """An ``nn.Parameter`` on the device is an alias of the tensor it wraps.
@@ -297,7 +255,6 @@ def test_view_of_a_parameter_after_a_write(engine):
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="p.data = t changes PyTorch's metadata, not the node")
 @pytest.mark.parametrize("engine", sorted(engines.ENGINES))
 @pytest.mark.parametrize("how", ["data", "vector_to_parameters"])
 def test_assigning_data(engine, how):
