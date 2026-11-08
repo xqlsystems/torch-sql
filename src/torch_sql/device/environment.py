@@ -29,7 +29,7 @@ from ..boundary.layout import to_dense, to_table
 from ..engines import Engine
 from ..engines import engine as make_engine
 from ..ops import LOWERINGS, Context, OperatorNotFound
-from .tensor import Tensor
+from .tensor import Storage, Tensor
 
 aten = torch.ops.aten
 
@@ -81,8 +81,10 @@ class Environment:
         self._ranges: dict[int, g.Table] = {}
         self._points: dict[int, g.Table] = {}
         self._index_tables: dict = {}
-        #: Tensors created or written since the last sync(), by id.
-        self._pending: weakref.WeakValueDictionary[int, Tensor] = weakref.WeakValueDictionary()
+        #: The storage of each tensor created or written since the last
+        #: sync(), by id. Not the tensors: PyTorch can't swap a tensor that
+        #: has a weak reference, as module.to() does.
+        self._pending: weakref.WeakValueDictionary[int, Storage] = weakref.WeakValueDictionary()
         self._mode = _FunctionMode(self)
         self._depth = 0
 
@@ -171,8 +173,12 @@ class Environment:
         every tensor still alive that was created or written since the last
         such call (§7.1)."""
         if not tensors:
-            tensors = tuple(self._pending.values())
+            # Each value's table is saved under its node, so later queries
+            # read it, and kept alive by the storage.
+            for storage in tuple(self._pending.values()):
+                storage.table = self.materialize(storage.node)
             self._pending.clear()
+            return
         for t in tensors:
             t._node = self.materialize(t._node)
 
