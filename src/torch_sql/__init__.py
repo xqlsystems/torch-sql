@@ -19,9 +19,19 @@ from .ops import OperatorNotFound
 
 
 def sync(*tensors: Tensor) -> None:
-    """Run what each tensor's value depends on, and keep it as a table."""
-    for t in tensors:
-        t._env.sync(t)
+    """Run what each tensor's value depends on, and keep it as a table.
+
+    With no tensors, sync every tensor of the active environment that was
+    created or written since the last ``sync()`` and is still alive: the
+    end of a step (design §7.1)."""
+    if tensors:
+        for t in tensors:
+            t._env.sync(t)
+        return
+    env = Environment.active()
+    if env is None:
+        raise RuntimeError("torch_sql.sync() with no tensors needs an active Environment")
+    env.sync()
 
 
 __all__ = ["Environment", "OperatorNotFound", "Tensor", "sync"]
