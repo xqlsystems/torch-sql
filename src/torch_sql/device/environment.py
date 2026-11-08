@@ -51,6 +51,11 @@ IN_PLACE_VIEWS = {
     aten.resize_.default,
 }
 
+#: View ops whose result holds the same values as their input, so that an
+#: in-place op on the result writes the input's storage, as
+#: ``p.detach().lerp_(q, w)`` does in PyTorch's EMA of weights.
+SAME_VALUES = {aten.detach.default, aten.alias.default, aten.lift_fresh.default}
+
 #: In-place ops whose functional form isn't named after them.
 FUNCTIONAL = {
     aten.normal_.default: aten.normal_functional.default,
@@ -74,7 +79,10 @@ class Environment:
         #: Tables that hold nodes' values, by node id, for nodes already read.
         self._saved: weakref.WeakValueDictionary[int, g.Table] = weakref.WeakValueDictionary()
         self._ranges: dict[int, g.Table] = {}
+        self._points: dict[int, g.Table] = {}
         self._index_tables: dict = {}
+        #: Tensors created or written since the last sync(), by id.
+        self._pending: weakref.WeakValueDictionary[int, Tensor] = weakref.WeakValueDictionary()
         self._mode = _FunctionMode(self)
         self._depth = 0
 
@@ -83,12 +91,19 @@ class Environment:
 
     # -- Activation -------------------------------------------------------
 
+    @staticmethod
+    def active() -> Environment | None:
+        """The innermost active environment, if any."""
+        return _active[-1] if _active else None
+
     def __enter__(self):
         self._mode.__enter__()
+        _active.append(self)
         self._depth += 1
         return self
 
     def __exit__(self, *exc):
+        _active.remove(self)
         self._depth -= 1
         return self._mode.__exit__(*exc)
 
@@ -125,6 +140,13 @@ class Environment:
             self._ranges[n] = self.upload(torch.arange(n))
         return self._ranges[n]
 
+    def point(self, k: int) -> g.Table:
+        """A one-row table whose value is ``k``, registered once: a join
+        with it selects index ``k`` (``select``)."""
+        if k not in self._points:
+            self._points[k] = self.upload(torch.tensor([k]))
+        return self._points[k]
+
     def saved(self, node: g.Node) -> g.Node:
         """The table holding ``node``'s value if one does, else ``node``."""
         return self._saved.get(node.id, node)
@@ -145,7 +167,12 @@ class Environment:
 
     def sync(self, *tensors: Tensor) -> None:
         """Run what each tensor's value depends on, and keep it as a table
-        (§9.6). Later ops on these tensors read the tables."""
+        (§9.6). Later ops on these tensors read the tables. With no tensors,
+        every tensor still alive that was created or written since the last
+        such call (§7.1)."""
+        if not tensors:
+            tensors = tuple(self._pending.values())
+            self._pending.clear()
         for t in tensors:
             t._node = self.materialize(t._node)
 
@@ -177,13 +204,18 @@ class Environment:
             )
         out = self._meta(func, args, kwargs)
         flat, spec = tree_flatten(out)
+        for t in flat:
+            if isinstance(t, torch.Tensor):
+                # A result PyTorch gives in a dtype torch-sql lacks, such as
+                # int / int in float32, is refused before it's lowered.
+                g.check_dtype(t.dtype)
         if flat and all(isinstance(t, torch.Tensor) and t.numel() == 0 for t in flat):
             # A result with no elements is a relation with no rows, whatever
             # the op.
             nodes = tree_unflatten([self.empty(t.shape, t.dtype) for t in flat], spec)
-        else:
-            nodes = lowering(Context(func, out, self), *self._nodes(args), **self._nodes(kwargs))
-        return self._wrap(func, out, nodes)
+            return self._wrap(func, out, nodes)
+        nodes = lowering(Context(func, out, self), *self._nodes(args), **self._nodes(kwargs))
+        return self._wrap(func, out, nodes, self._aliasing(func, out, lowering, args, kwargs))
 
     def empty(self, shape, dtype) -> g.Node:
         """A tensor with no elements: no rows."""
@@ -234,7 +266,29 @@ class Environment:
 
         return tree_map(node, tree)
 
-    def _wrap(self, func, out, nodes):
+    def _aliasing(self, func, out, lowering, args, kwargs):
+        """For a view op (one whose result aliases its input, §8.6): the
+        input, and a function that lowers the op again from the input's
+        storage's node, giving every result's node."""
+        returns = func._schema.returns
+        if (
+            not returns
+            or returns[0].alias_info is None
+            or not args
+            or not isinstance(args[0], Tensor)
+        ):
+            return None
+        base, parent = args[0], args[0]._derive
+        rest, kw = self._nodes(args[1:]), self._nodes(kwargs)
+
+        def relower(node):
+            if parent is not None:
+                node = parent(node)
+            return tree_flatten(lowering(Context(func, out, self), node, *rest, **kw))[0]
+
+        return base, relower
+
+    def _wrap(self, func, out, nodes, aliasing=None):
         flat, spec = tree_flatten(out)
         produced, _ = tree_flatten(nodes)
         if len(flat) != len(produced):
@@ -252,7 +306,20 @@ class Environment:
                     f"{tuple(meta.shape)} {meta.dtype}"
                 )
             node.hint.setdefault("aten", str(func))
-            wrapped.append(Tensor(node, self, stride=meta.stride()))
+            if aliasing is None:
+                wrapped.append(Tensor(node, self, stride=meta.stride()))
+                continue
+            base, relower = aliasing
+            wrapped.append(
+                Tensor(
+                    node,
+                    self,
+                    stride=meta.stride(),
+                    alias_of=base,
+                    derive=_result(relower, len(wrapped)),
+                    same_values=func in SAME_VALUES,
+                )
+            )
         return tree_unflatten(wrapped, spec)
 
     def _in_place(self, func, args, kwargs):
@@ -303,7 +370,16 @@ class Environment:
                 index=tuple(g.Col(0, c) for c in node.columns),
                 value=as_dtype(g.Col(0, "v"), node.dtype, target.dtype),
             )
-        target._node = node
+        target._write(node)
+
+
+def _result(relower, k):
+    """The function giving result ``k`` of a view op from its base's node."""
+    return lambda node: relower(node)[k]
+
+
+#: The active environments, innermost last.
+_active: list[Environment] = []
 
 
 def _drop(engine: Engine, name: str):
@@ -323,6 +399,7 @@ def _to_copy(env: Environment, x, **kwargs):
         dtype = kwargs.get("dtype")
         return cpu.to(dtype) if dtype is not None else cpu
     out = env._meta(aten._to_copy.default, (x,), kwargs)
+    g.check_dtype(out.dtype)
     return env._wrap(
         aten._to_copy.default,
         out,

@@ -4,13 +4,17 @@ of several on the index columns they share.
 The SQL must mean what PyTorch means (P1), and three things differ between
 SQL engines and IEEE floating point, which PyTorch follows:
 
-- **NaN in comparisons.** SQL orders NaN above every number, and NaN equals
-  NaN. In PyTorch every comparison with NaN is false except ``!=``. Float
-  comparisons therefore check ``isnan`` (:func:`compare`).
+- **NaN in comparisons.** In PyTorch every comparison with NaN is false
+  except ``!=``. SQL says NaN equals NaN, and its engines don't agree on
+  where NaN sorts: DuckDB puts every NaN above every number, and DataFusion
+  uses IEEE's total order, which puts a NaN with its sign bit set (the NaN
+  x86 gives for ``0/0``) below ``-inf``. So every float comparison and
+  every ``CASE`` that a NaN could reach checks ``isnan`` (:func:`compare`).
 - **Domain errors.** DuckDB raises on ``ln(0)``, ``ln(-1)`` and
   ``sqrt(-1)``, and DataFusion on ``sqrt(-1)``, where PyTorch returns
-  ``-inf`` or NaN. ``log`` and ``sqrt`` guard their argument with ``CASE``,
-  which both engines evaluate only on the rows that take a branch.
+  ``-inf`` or NaN, and DuckDB on ``sin`` and ``cos`` of an infinity, where
+  PyTorch returns NaN. Those ops guard their argument with ``CASE``, which
+  both engines evaluate only on the rows that take a branch.
 - **Ties.** ``maximum`` and ``minimum`` are ``CASE`` expressions, so ddx's
   gradient at a tie goes to the first argument, where PyTorch's splits it
   in half.
@@ -194,8 +198,9 @@ def exp(ctx, x):
 @op(aten.log.default)
 def log(ctx, x):
     # ln(0) is -inf and ln(x < 0) is NaN, as in PyTorch; DuckDB raises on
-    # both. A NaN takes the first branch, since SQL orders NaN above 0, and
-    # ln(NaN) is NaN on both engines.
+    # both. A NaN takes the first branch on DuckDB and the last on
+    # DataFusion if its sign bit is set; either way the result is NaN, so
+    # this needs no isnan. sqrt and rsqrt are the same.
     def fn(v):
         zero = scalar(0.0, ctx.out.dtype)
         return case(g.call(">", v, zero), g.call("ln", v), case(g.call("=", v, zero), NEG_INF, NAN))
@@ -232,21 +237,28 @@ def abs_(ctx, x):
     return unary(ctx, x, lambda v: g.call("abs", v))
 
 
-@op(aten.sin.default)
-def sin(ctx, x):
-    return unary(ctx, x, lambda v: g.call("sin", v))
+def _periodic(name):
+    # sin and cos of ±inf are NaN in PyTorch; DuckDB raises. v - v is NaN
+    # exactly when v is infinite or NaN.
+    def lower(ctx, x):
+        return unary(ctx, x, lambda v: case(g.call("isnan", v - v), NAN, g.call(name, v)))
+
+    return lower
 
 
-@op(aten.cos.default)
-def cos(ctx, x):
-    return unary(ctx, x, lambda v: g.call("cos", v))
+op(aten.sin.default)(_periodic("sin"))
+op(aten.cos.default)(_periodic("cos"))
 
 
 @op(aten.relu.default)
 def relu(ctx, x):
-    # x <= 0 is false for NaN, so NaN passes through, as in PyTorch.
     zero = scalar(0, ctx.out.dtype)
-    return unary(ctx, x, lambda v: case(g.call("<=", v, zero), zero, v))
+    if ctx.out.dtype not in FLOATS:
+        return unary(ctx, x, lambda v: case(g.call("<=", v, zero), zero, v))
+    # NaN passes through, as in PyTorch.
+    return unary(
+        ctx, x, lambda v: case(g.call("isnan", v), v, case(g.call("<=", v, zero), zero, v))
+    )
 
 
 #: GELU's tanh form, with PyTorch's constant sqrt(2/pi).
@@ -300,24 +312,22 @@ def where(ctx, cond, a, b):
     return elementwise(shape, dtype, [cond, a, b], case, compute=[torch.bool, dtype, dtype])
 
 
-@op(aten.maximum.default)
-def maximum(ctx, a, b):
-    # a >= b is true when a is NaN, since SQL orders NaN above every number,
-    # and false when b is: either way the NaN wins, as in PyTorch.
-    return binary(ctx, a, b, lambda x, y: case(g.call(">=", x, y), x, y))
+def _extremum(cmp):
+    # A NaN in either argument wins, as in PyTorch.
+    def lower(ctx, a, b):
+        def fn(x, y):
+            pick = case(g.call(cmp, x, y), x, y)
+            if ctx.out.dtype not in FLOATS:
+                return pick
+            return case(any_of(isnan(x), isnan(y)), NAN, pick)
+
+        return binary(ctx, a, b, fn)
+
+    return lower
 
 
-@op(aten.minimum.default)
-def minimum(ctx, a, b):
-    def fn(x, y):
-        nan = any_of(isnan(x), isnan(y))
-        return (
-            case(nan, NAN, case(g.call("<=", x, y), x, y))
-            if ctx.out.dtype in FLOATS
-            else case(g.call("<=", x, y), x, y)
-        )
-
-    return binary(ctx, a, b, fn)
+op(aten.maximum.default)(_extremum(">="))
+op(aten.minimum.default)(_extremum("<="))
 
 
 @op(aten.clamp.default, aten.clamp.Tensor)
