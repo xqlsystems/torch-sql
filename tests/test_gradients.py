@@ -115,6 +115,94 @@ def test_gradient_of_a_sum_of_an_expand(env):
     close(w.grad, torch.tensor([2.0], dtype=F64))
 
 
+def _leaf_and_loss(program):
+    """``program(device)`` returns a leaf and a loss: the leaf's gradient
+    on the device, and on the CPU."""
+    got = []
+    for device in ("sql", "cpu"):
+        leaf, loss = program(device)
+        loss.backward()
+        got.append(leaf.grad)
+    return got
+
+
+def _leaf(device):
+    return torch.tensor([1.0, 2.0, 3.0], dtype=F64, device=device).requires_grad_()
+
+
+def test_view_of_a_parameter_after_a_write(env):
+    # A view of a parameter derives its node from the parameter's, which
+    # backward() treats as the leaf (§8.6).
+    def program(device):
+        w = torch.nn.Parameter(_leaf(device).detach())
+        v = w[:2]
+        with torch.no_grad():
+            w.mul_(2)  # as an optimizer step does
+        return w, (v * v).sum()
+
+    close(*_leaf_and_loss(program))
+
+
+@pytest.mark.parametrize("how", ["no_grad", "detach", "data"])
+def test_untracked_write_to_a_tensor_with_history_is_refused(env, how):
+    # PyTorch would keep y's history, MulBackward; torch-sql can't yet.
+    w = _leaf("sql")
+    y = w * 2
+    with pytest.raises(NotImplementedError, match="autograd doesn't record"):
+        if how == "no_grad":
+            with torch.no_grad():
+                y.add_(1)
+        elif how == "detach":
+            y.detach().add_(1)
+        else:
+            y.data.add_(1)
+
+
+def test_tracked_write_to_a_tensor_with_history(env):
+    def program(device):
+        w = _leaf(device)
+        y = w * 2
+        y.mul_(3).add_(w).exp_()  # exp(7w)
+        return w, y.sum()
+
+    close(*_leaf_and_loss(program))
+
+
+def test_leaf_written_after_use(env):
+    # Each use of a leaf adds to its gradient, whichever value it read, as
+    # PyTorch's AccumulateGrad does: 1 + 2 + 3.
+    def program(device):
+        w = _leaf(device)
+        c = w * 2
+        with torch.no_grad():
+            w.add_(0.5)
+        d = w * 3
+        with torch.no_grad():
+            w.mul_(2)
+        return w, w.sum() + c.sum() + d.sum()
+
+    close(*_leaf_and_loss(program))
+
+
+def test_leaf_written_after_a_use_that_saved_it(env):
+    w = _leaf("sql")
+    c = w * w
+    with torch.no_grad():
+        w.add_(0.5)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        c.sum().backward()
+
+
+def test_leaf_read_between_use_and_backward(env):
+    # Reading a leaf syncs it, replacing its node with a table; the loss
+    # reads the node from before.
+    w = (torch.ones(3, dtype=F64, device="sql") * 2).requires_grad_()
+    c = w * 2
+    w.cpu()
+    c.sum().backward()
+    close(w.grad, torch.full((3,), 2.0, dtype=F64))
+
+
 def test_a_step_ends_with_tables(env):
     model = mlp().to("sql")
     opt = torch.optim.Adam(model.parameters())

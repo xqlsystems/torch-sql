@@ -812,16 +812,34 @@ This is how torchax handles in-place ops too.
 
 A view (`x[:2]`, `x.view(2, 2)`, `x.t()`) and `x.detach()` share their
 base's storage in PyTorch, so they must see an in-place op on it. In
-torch-sql they share a *storage* object, which holds the base's current
-node, and each alias keeps the function that derives its node from it.
-After a write, each alias derives its node again. DataFusion Accelerated's
-table handles work the same way: a query reads a handle's current buffer,
-not the one it was planned against (its design, §5.2). An in-place op on
+torch-sql they share a *storage* object, which holds the owner's current
+node. Each alias keeps the tensor it was taken from and the function that
+derives its node from that tensor's. After a write, each alias derives its
+node again, from its base's current node, so a chain of aliases (a view of
+an `nn.Parameter`, itself an alias of the tensor it wraps) shares one node
+per value. DataFusion Accelerated, the planned DataFusion extension that
+runs plans on accelerators (open question 8), has table handles that work
+the same way: a query reads a handle's current buffer, not the one it was
+planned against (its design, §5.2). `p.data = t` makes `p` share `t`'s
+storage, as in PyTorch. An in-place op on
 `x.detach()` writes `x`'s storage, which is how PyTorch's EMA of weights
 (`AveragedModel`) updates its average.
 
 Writing through a view that selects or rearranges values (`x[:, 0] += 1`)
 is refused in the first version, with an error. Samudra doesn't need it.
+
+Gradients follow each tensor's history, as in PyTorch, whatever later
+writes do to its value. An in-place op that autograd records (`y.mul_(3)`
+outside `torch.no_grad()`) extends `y`'s history from its old node. A
+leaf's gradient sums over every use of it, whichever value the use read:
+`backward()` differentiates with respect to each earlier node of the leaf
+that the loss reads, as well as the current one (§11.1). Two cases differ
+from PyTorch. A use that *saved* a value later written (`c = w * w`, then
+`w.add_(1)` under `no_grad`) raises PyTorch's own "modified by an inplace
+operation" error, from PyTorch's check of its saved tensors. And an
+in-place op autograd doesn't record (under `no_grad`, or through
+`.detach()`) on a tensor with a `grad_fn` is refused, since torch-sql would
+cut the tensor's history (D17).
 
 ### 8.7 Small constants
 
@@ -1522,6 +1540,9 @@ or a profile calls for something else. Each has an issue, labelled
   is too ([#13](https://github.com/xqlsystems/torch-sql/issues/13));
 - writing through a view is refused (§8.6,
   [#14](https://github.com/xqlsystems/torch-sql/issues/14));
+- an in-place op that autograd doesn't record, on a tensor with a
+  `grad_fn`, is refused (§8.6,
+  [#18](https://github.com/xqlsystems/torch-sql/issues/18));
 - at a tie, `maximum` and `minimum` give the gradient to the first
   argument, where PyTorch splits it
   ([#15](https://github.com/xqlsystems/torch-sql/issues/15));

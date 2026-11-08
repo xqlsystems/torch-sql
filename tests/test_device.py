@@ -191,6 +191,23 @@ def test_writing_a_detached_alias_writes_the_base(env):
     same(tail, torch.full((2,), 2.0, dtype=F64))
 
 
+@pytest.mark.parametrize("how", ["data", "vector_to_parameters"])
+def test_assigning_data(env, how):
+    def program(device):
+        torch.manual_seed(0)
+        model = torch.nn.Linear(2, 2, dtype=F64).to(device)
+        if how == "data":
+            model.weight.data = model.weight.data * 0 + 3
+            model.bias.data = torch.zeros(3, dtype=F64, device=device)
+        else:
+            vector = torch.nn.utils.parameters_to_vector(model.parameters())
+            torch.nn.utils.vector_to_parameters(vector * 2, model.parameters())
+        return [p.detach() for p in model.parameters()]
+
+    for a, b in zip(program("sql"), program("cpu"), strict=True):
+        same(a, b)
+
+
 def test_deepcopy(env):
     import copy
 
