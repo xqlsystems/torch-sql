@@ -34,13 +34,14 @@ from .. import graph as g
 
 
 class Storage:
-    """What a tensor and its aliases share: the owner's current node, and a
-    count of the in-place writes to it."""
+    """What a tensor and its aliases share: the owner's current node, a
+    count of the in-place writes to it, and the table that holds its value
+    once ``torch_sql.sync()`` has run it."""
 
-    __slots__ = ("node", "version", "__weakref__")
+    __slots__ = ("node", "version", "table", "__weakref__")
 
     def __init__(self, node: g.Node):
-        self.node, self.version = node, 0
+        self.node, self.version, self.table = node, 0, None
 
 
 class Tensor(torch.Tensor):
@@ -80,9 +81,9 @@ class Tensor(torch.Tensor):
         #: The table holding the value of a tensor that keeps its graph
         #: (see Environment.sync).
         t._table = None
-        env._pending[id(t)] = t
         if alias_of is None:
             t._storage, t._derive, t._same_values = Storage(node), None, True
+            env._pending[id(t._storage)] = t._storage
         else:
             t._storage, t._derive = alias_of._storage, derive
             t._same_values = same_values and alias_of._same_values
@@ -119,7 +120,8 @@ class Tensor(torch.Tensor):
         self._storage.node = node
         self._storage.version += 1
         self._table = None
-        self._env._pending[id(self)] = self
+        self._storage.table = None
+        self._env._pending[id(self._storage)] = self._storage
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):

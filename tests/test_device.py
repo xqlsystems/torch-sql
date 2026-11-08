@@ -118,8 +118,8 @@ def test_sync_with_no_tensors_syncs_the_step(env):
     y = x * 2
     x.add_(1)
     torch_sql.sync()
-    assert isinstance(y._node, torch_sql.graph.Table)
-    assert isinstance(x._node, torch_sql.graph.Table)
+    assert isinstance(env.saved(y._node), torch_sql.graph.Table)
+    assert isinstance(env.saved(x._node), torch_sql.graph.Table)
     same(x - 1, y.cpu() / 2)
 
 
