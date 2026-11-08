@@ -68,6 +68,21 @@ def test_module_to_sql(env):
     same(m.weight, w)
 
 
+def test_module_converted_again_on_sql(env):
+    # PyTorch swaps each parameter with a .detach() alias of itself here,
+    # with swap_tensors (§8.6).
+    torch.manual_seed(0)
+    m = torch.nn.Linear(3, 2).double()
+    w = m.weight.detach().clone()
+    m.to("sql")
+    weight = m.weight
+    m.double().to("sql")
+    assert m.weight is weight
+    with torch.no_grad():
+        m.weight.add_(1)
+    same(m.weight, w + 1)
+
+
 def test_module_created_on_sql_matches_the_cpu(env):
     # nn.Linear initializes its weights in place, with uniform_: torch-sql
     # draws on the CPU, so the same seed gives the same weights.
