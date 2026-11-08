@@ -238,7 +238,7 @@ class Environment:
 
     def dispatch(self, func, types, args, kwargs):
         if "out" in kwargs:
-            raise NotImplementedError(f"{func} with out=")
+            return self._out(func, args, kwargs)
         special = _SPECIAL.get(func)
         if special is not None:
             return special(self, *args, **kwargs)
@@ -410,6 +410,26 @@ class Environment:
         self._assign(target, result._node)
         return target
 
+    def _out(self, func, args, kwargs):
+        """An op with ``out=``, such as ``torch.maximum(a, b, out=a)`` in
+        ``Adam(amsgrad=True)``: the functional op, assigned to ``out`` as an
+        in-place op assigns its result (§8.6)."""
+        kwargs = dict(kwargs)
+        target = kwargs.pop("out")
+        functional = _functional_of(func)
+        if functional is None or not isinstance(target, Tensor):
+            raise NotImplementedError(f"{func} with out=")
+        if target._is_view():
+            raise NotImplementedError(
+                f"{func} writes through a view, which torch-sql doesn't support (design §8.6)"
+            )
+        result = self.dispatch(functional, (), args, kwargs)
+        if not isinstance(result, Tensor) or result.shape != target.shape:
+            # PyTorch resizes out=; torch-sql's tensors keep their shape.
+            raise NotImplementedError(f"{func} with an out= of another shape")
+        self._assign(target, result._node)
+        return target
+
     def _assign(self, target: Tensor, node: g.Node):
         if _untracked(target):
             raise NotImplementedError(
@@ -430,6 +450,19 @@ class Environment:
                 value=as_dtype(g.Col(0, "v"), node.dtype, target.dtype),
             )
         target._write(node)
+
+
+def _functional_of(func):
+    """The overload of ``func`` without ``out=``: ``maximum.out`` is
+    ``maximum.default``, ``add.out`` is ``add.Tensor``."""
+    packet = getattr(aten, func._schema.name.split("::")[1])
+    params = [a.name for a in func._schema.arguments if a.name != "out"]
+    for name in packet.overloads():
+        candidate = getattr(packet, name)
+        schema = candidate._schema
+        if not schema.is_mutable and [a.name for a in schema.arguments] == params:
+            return candidate
+    return None
 
 
 def _result(relower, k):

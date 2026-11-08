@@ -80,6 +80,11 @@ OPS = [
     "all",
     "reshape",
     "view",
+    "argmax",
+    "argmin",
+    "max",
+    "min",
+    "unbind",
 ]
 
 #: (op, why) for samples torch-sql refuses on purpose. Each refusal raises
