@@ -6,7 +6,7 @@ torchax, a PyTorch backend that runs ops as JAX, makes the same kind of
 tensor, and as it does, torch-sql allocates them on PyTorch's ``meta``
 device, which tracks shapes and dtypes but holds no data. So ``t.device`` reads ``meta``, not
 ``sql``; giving it a ``sql`` device would need PyTorch's private
-Python-backend setup (spike S1, open question 11 of the design).
+Python-backend setup (spike S1), which the design decides against (D16).
 
 A tensor holds a node of the recorded graph (:mod:`torch_sql.graph`) and the
 environment that records it. Ops make new tensors with new nodes; nothing

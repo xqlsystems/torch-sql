@@ -848,7 +848,8 @@ process, in C++, because PyTorch finds no device guard for it. PyTorch's
 registers one from Python, and then autograd, checkpointing and
 `torch.compile` all work. It is experimental and private, against the spirit
 of P5. Allocating on `meta`, as torchax does, needs neither, at the cost of
-`p.device` not reading `"sql"`. Which to use is open question 11 (§17).
+`p.device` not reading `"sql"`. torch-sql allocates on `meta`, as torchax
+does (D16).
 - An `Environment` holds a `TorchFunctionMode`, a `TorchDispatchMode` and the
   op table. While it is active, every op on a `"sql"` tensor, and every op that
   creates one, goes through `Environment.dispatch`.
@@ -1414,10 +1415,8 @@ After M5: the runtime (with others), GPUs, and distribution.
 10. **Splitting data across ranks.** Whether the co-processor's loader
     reproduces Samudra's sampler exactly (same windows on the same rank), or
     may choose its own split, for example by Zarr chunk.
-11. **How to register the device.** PyTorch's private Python-backend setup,
-    which makes `p.device` read `"sql"`, or the `meta` device, as torchax
-    does (§9.1). The first is experimental; the second is public but
-    reports the wrong device.
+11. **How to register the device.** Decided: the `meta` device, as torchax
+    does (D16).
 12. **Pooling a partial tensor.** Whether an average pool over a coastline
     averages only its ocean children, or counts land as zero. Like open
     question 1, this changes the model.
@@ -1506,3 +1505,9 @@ that function (ddx#251).
 three ConvNeXt blocks as one query is 136,107 operators (spike S8). torch-sql
 saves the input of every norm, and every other value read more than once, as
 a table between plans (§9.6).
+
+**D16. Allocate on `meta`, as torchax does (Alex, 2026-11-08).** A
+torch-sql tensor is a wrapper subclass on PyTorch's `meta` device, so
+`p.device` reads `meta`, not `sql` (§9.1). The alternative, PyTorch's
+private Python-backend setup, is experimental (P5). torch-sql follows
+torchax's choice here, and will revisit it if torchax does.
