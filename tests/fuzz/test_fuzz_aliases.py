@@ -42,7 +42,9 @@ WRITES = {
     "add_": lambda t: t.add_(0.5),
     "mul_": lambda t: t.mul_(-1.5),
     "zero_": lambda t: t.zero_(),
-    "clamp_": lambda t: t.clamp_(-0.5, 0.75),
+    # Bounds off the data's grid of 0.001, so that no value sits on a bound,
+    # where the gradient is a convention.
+    "clamp_": lambda t: t.clamp_(-0.4321, 0.7654),
     "copy_": lambda t: t.copy_(t * 2 + 1),
     "lerp_": lambda t: t.lerp_(t * 0 + 1, 0.25),
 }
@@ -292,3 +294,32 @@ def test_view_of_a_parameter_after_a_write(engine):
 
     got, expected = _gradient(engine, program)
     assert torch.equal(got, expected), f"got {got.tolist()}, PyTorch {expected.tolist()}"
+
+
+@pytest.mark.pinned
+@pytest.mark.xfail(strict=True, reason="p.data = t changes PyTorch's metadata, not the node")
+@pytest.mark.parametrize("engine", sorted(engines.ENGINES))
+@pytest.mark.parametrize("how", ["data", "vector_to_parameters"])
+def test_assigning_data(engine, how):
+    """``p.data = t`` makes ``p`` share ``t``'s storage. On the device it
+    changes the wrapper's shape and dtype (PyTorch's ``set_data``) but not
+    its node, so the assignment silently does nothing.
+    ``torch.nn.utils.vector_to_parameters`` assigns ``.data`` this way."""
+
+    def program(device):
+        torch.manual_seed(0)
+        model = torch.nn.Linear(2, 2).double()
+        if device == "sql":
+            model = model.to("sql")
+        if how == "data":
+            model.weight.data = model.weight.data * 0 + 3
+        else:
+            vector = torch.nn.utils.parameters_to_vector(model.parameters())
+            torch.nn.utils.vector_to_parameters(vector * 2, model.parameters())
+        return [p.detach().cpu() for p in model.parameters()]
+
+    expected = program("cpu")
+    with torch_sql.Environment(make_engine(engine)):
+        got = program("sql")
+    for a, b in zip(got, expected, strict=True):
+        torch.testing.assert_close(a, b)
