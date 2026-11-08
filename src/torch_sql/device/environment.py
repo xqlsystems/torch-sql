@@ -345,7 +345,7 @@ class Environment:
     def _aliasing(self, func, out, lowering, args, kwargs, stop=False):
         """For a view op (one whose result aliases its input, §8.6): the
         input, and a function that lowers the op again from the input's
-        storage's node, giving every result's node."""
+        current node, giving every result's node."""
         returns = func._schema.returns
         if (
             not returns
@@ -354,16 +354,13 @@ class Environment:
             or not isinstance(args[0], Tensor)
         ):
             return None
-        base, parent = args[0], args[0]._derive
         rest, kw = self._nodes(args[1:]), self._nodes(kwargs)
 
         def relower(node):
-            if parent is not None:
-                node = parent(node)
             nodes = lowering(Context(func, out, self), node, *rest, **kw)
             return tree_flatten(_stopped(nodes) if stop else nodes)[0]
 
-        return base, relower
+        return args[0], relower
 
     def _wrap(self, func, out, nodes, aliasing=None):
         flat, spec = tree_flatten(out)
@@ -435,6 +432,12 @@ class Environment:
         return target
 
     def _assign(self, target: Tensor, node: g.Node):
+        if _untracked(target):
+            raise NotImplementedError(
+                "an in-place op that autograd doesn't record (under torch.no_grad(), or "
+                "through .detach() or .data) on a tensor with a grad_fn: PyTorch keeps the "
+                "tensor's gradient, which torch-sql can't yet (design §8.6, issue #18)"
+            )
         if node.shape != target._node.shape:
             raise AssertionError(f"in-place result {node.shape} for {target._node.shape}")
         if node.dtype != target.dtype:
@@ -468,6 +471,23 @@ def _stopped(nodes):
         else n,
         nodes,
     )
+
+
+def _untracked(target: Tensor) -> bool:
+    """Whether writing ``target`` would change the value of a tensor with a
+    history (a ``grad_fn``) without autograd recording the write. PyTorch
+    then keeps the history, so the gradient is the old value's; torch-sql
+    gives the tensor the write's node, which a stop-gradient cuts from it.
+    Autograd records the write only if gradients are enabled and the target
+    is the tensor with the history, not a ``.detach()`` alias of it."""
+    if torch.is_grad_enabled() and target.grad_fn is not None:
+        return False
+    t = target
+    while t is not None:
+        if t.grad_fn is not None:
+            return True
+        t = t._source
+    return False
 
 
 def _requires_grad(args, kwargs) -> bool:
