@@ -113,6 +113,21 @@ def test_sync_keeps_a_table(env):
     same(y + 1, x.cpu() * 2 + 1)
 
 
+def test_sync_with_no_tensors_syncs_the_step(env):
+    x = torch.randn(3, dtype=F64, device="sql")
+    y = x * 2
+    x.add_(1)
+    torch_sql.sync()
+    assert isinstance(env.saved(y._node), torch_sql.graph.Table)
+    assert isinstance(env.saved(x._node), torch_sql.graph.Table)
+    same(x - 1, y.cpu() / 2)
+
+
+def test_sync_with_no_tensors_needs_an_environment():
+    with pytest.raises(RuntimeError, match="active Environment"):
+        torch_sql.sync()
+
+
 def test_tables_are_dropped_with_their_tensors(env):
     x = torch.randn(3, dtype=F64, device="sql")
     name = x._node.name
@@ -142,6 +157,49 @@ def test_writing_through_a_view_is_refused(env):
         x[0].add_(1)
     with pytest.raises(NotImplementedError, match="view"):
         x[:, 1] = 2.0
+
+
+@pytest.mark.parametrize(
+    "alias",
+    {
+        "slice": lambda x: x[:2],
+        "select": lambda x: x[1],
+        "detach": lambda x: x.detach(),
+        "view": lambda x: x.view(2, 2),
+        "transpose": lambda x: x.view(2, 2).t(),
+        "expand": lambda x: x.expand(3, 4),
+        "chain": lambda x: x.detach()[1:].unsqueeze(0),
+    }.items(),
+    ids=lambda a: a[0],
+)
+def test_in_place_reaches_aliases(env, alias):
+    # A view and .detach() share their base's storage, as in PyTorch (§8.6).
+    def program(device):
+        x = torch.zeros(4, dtype=F64, device=device)
+        y = alias[1](x)
+        x.add_(1).mul_(3)
+        return y
+
+    same(program("sql"), program("cpu"))
+
+
+def test_writing_a_detached_alias_writes_the_base(env):
+    x = torch.zeros(3, dtype=F64, device="sql")
+    tail = x[1:]
+    x.detach().add_(2)  # as AveragedModel's EMA does
+    same(x, torch.full((3,), 2.0, dtype=F64))
+    same(tail, torch.full((2,), 2.0, dtype=F64))
+
+
+def test_deepcopy(env):
+    import copy
+
+    m = torch.nn.Linear(3, 2, dtype=F64, device="sql")
+    c = copy.deepcopy(m)
+    assert isinstance(c.weight, torch.nn.Parameter) and c.weight.requires_grad
+    with torch.no_grad():
+        c.weight.add_(1)
+    same(c.weight, m.weight.cpu() + 1)
 
 
 def test_copy_into(env):
@@ -199,6 +257,13 @@ def test_cpu_tensors_beside_sql_ones(env):
         x + torch.ones(2, dtype=F64)
 
 
+def test_true_division_of_integers_is_refused(env):
+    # PyTorch gives float32, which torch-sql doesn't support yet (§8.2).
+    a = torch.arange(1, 4, device="sql")
+    with pytest.raises(NotImplementedError, match="float32"):
+        a / a
+
+
 def test_unsupported_dtype_is_refused(env):
     with pytest.raises(NotImplementedError, match="float32"):
         torch.ones(2, device="sql")
@@ -219,7 +284,10 @@ def test_repr(env):
 
 # -- IEEE floating point: the SQL must mean what PyTorch means --------------
 
-SPECIAL = torch.tensor([NAN, INF, -INF, 0.0, -0.0, 1.0, -1.0, 2.5], dtype=F64)
+# -NAN has its sign bit set, as the NaN x86 gives for 0/0 does, which
+# DataFusion orders below -inf.
+SPECIAL = torch.tensor([NAN, -NAN, INF, -INF, 0.0, -0.0, 1.0, -1.0, 2.5], dtype=F64)
+N = len(SPECIAL)
 
 
 @pytest.mark.parametrize(
@@ -234,6 +302,8 @@ SPECIAL = torch.tensor([NAN, INF, -INF, 0.0, -0.0, 1.0, -1.0, 2.5], dtype=F64)
         torch.relu,
         torch.sigmoid,
         torch.reciprocal,
+        torch.sin,
+        torch.cos,
         lambda x: x.clamp(-1, 2),
         lambda x: x.clamp(min=0),
     ],
@@ -247,6 +317,8 @@ SPECIAL = torch.tensor([NAN, INF, -INF, 0.0, -0.0, 1.0, -1.0, 2.5], dtype=F64)
         "relu",
         "sigmoid",
         "reciprocal",
+        "sin",
+        "cos",
         "clamp",
         "clamp_min",
     ],
@@ -273,8 +345,8 @@ def test_unary_special_values(env, fn):
     ids=lambda f: f.__name__,
 )
 def test_binary_special_values(env, fn):
-    a = SPECIAL[:, None].expand(8, 8).contiguous()
-    b = SPECIAL[None, :].expand(8, 8).contiguous()
+    a = SPECIAL[:, None].expand(N, N).contiguous()
+    b = SPECIAL[None, :].expand(N, N).contiguous()
     same(fn(a.to("sql"), b.to("sql")), fn(a, b))
 
 
@@ -284,6 +356,28 @@ def test_binary_special_values(env, fn):
 def test_reductions_propagate_nan(env, fn):
     x = torch.tensor([[1.0, NAN, 3.0], [1.0, 2.0, 3.0]], dtype=F64)
     same(fn(x.to("sql"), 1), fn(x, 1))
+
+
+def test_nan_from_zero_over_zero(env):
+    z = torch.zeros(1, dtype=F64, device="sql")
+    assert torch.isnan(torch.relu(z / z).cpu()).all()
+    assert torch.isnan(torch.maximum(z / z, z + 1).cpu()).all()
+
+
+@pytest.mark.parametrize("fn", [torch.amax, torch.amin], ids=lambda f: f.__name__)
+def test_reductions_of_infinities(env, fn):
+    # DataFusion's grouped MAX of values that are all -inf is f64::MIN.
+    x = torch.tensor([[-INF, -INF], [INF, INF], [-INF, 1.0]], dtype=F64)
+    same(fn(x.to("sql"), 1), fn(x, 1))
+    same(fn(x.to("sql"), 1, keepdim=True), fn(x, 1, keepdim=True))
+
+
+def test_select_from_stacked_scalars(env):
+    # DataFusion pushes a filter on a constant index below an aggregate with
+    # no GROUP BY, which then gives a row of NULLs; select joins instead.
+    a = torch.ones(3, dtype=F64, device="sql")
+    losses = torch.stack([a.sum(), (2 * a).sum()])
+    assert (losses[0].item(), losses[1].item(), losses[-1].item()) == (3.0, 6.0, 6.0)
 
 
 def test_integer_sum_stays_integer(env):

@@ -106,14 +106,19 @@ def expand(ctx, x, size, *, implicit=False):
 
 @op(aten.select.int)
 def select(ctx, x, dim, index):
+    """A join with a one-row table holding ``index``, rather than a filter
+    on a constant. DataFusion 55 pushes a filter like ``i0 = 0`` below an
+    aggregate with no ``GROUP BY``, which then returns a row of NULLs, so
+    ``torch.stack([a.sum(), b.sum()])[0]`` would have two rows. A join is
+    also the form einfold and ddx want (§9.5)."""
     dim = dim % x.rank
     index = index % x.shape[dim]
     out = ctx.out
     return g.Select(
         tuple(out.shape),
         out.dtype,
-        (x,),
-        where=g.call("=", g.Col(0, f"i{dim}"), index),
+        (x, ctx.env.point(index)),
+        on=((g.Col(0, f"i{dim}"), g.Col(1, "v")),),
         index=tuple(g.Col(0, f"i{d}") for d in range(x.rank) if d != dim),
         value=g.Col(0, "v"),
     )

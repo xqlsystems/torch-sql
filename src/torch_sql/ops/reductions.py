@@ -8,6 +8,12 @@ don't, reliably: DataFusion's ``MAX`` returns NaN without a ``GROUP BY`` and
 skips it with one, and ``MIN`` skips it on both engines, since SQL orders
 NaN above every number. So a float ``amax`` checks for NaN itself, and
 ``amin`` of floats is ``-amax(-x)``.
+
+DataFusion 55's grouped ``MAX`` also gives ``f64::MIN`` (-1.797e308) for a
+group whose values are all ``-inf``, where PyTorch gives ``-inf``, so a
+float ``amax`` with a ``GROUP BY`` checks for that too. Its ``MAX`` without
+one is right. A row of attention scores that a mask fills with ``-inf`` is
+such a group.
 """
 
 from __future__ import annotations
@@ -43,6 +49,15 @@ def reduce(ctx, x: g.Node, dim, keepdim: bool, agg: str, *, dtype=None) -> g.Sel
     if agg == "MAX" and compute == torch.float64:
         flag = g.call("case", g.call("isnan", v), g.Lit(1, torch.int64), g.Lit(0, torch.int64))
         nan = g.call("=", g.Agg("MAX", flag), g.Lit(1, torch.int64))
+        if any(d not in dims for d in range(x.rank)):
+            above = g.call(
+                "case",
+                g.call(">", v, g.Lit(float("-inf"), torch.float64)),
+                g.Lit(1, torch.int64),
+                g.Lit(0, torch.int64),
+            )
+            none_above = g.call("=", g.Agg("MAX", above), g.Lit(0, torch.int64))
+            value = g.call("case", none_above, g.Lit(float("-inf"), torch.float64), value)
         value = g.call("case", nan, g.Lit(float("nan"), torch.float64), value)
     if compute == torch.int64:
         # DuckDB's SUM of BIGINT is a 128-bit DECIMAL.

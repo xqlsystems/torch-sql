@@ -119,13 +119,17 @@ def expr(e: Expr, aliases: list[str], ieee: str | None = None, grouped: bool = F
     """``e`` in SQL, reading input ``k`` under the alias ``aliases[k]``, and
     a non-finite constant from :data:`IEEE` under the alias ``ieee``. In a
     grouping ``SELECT`` (``grouped``), a constant read outside an aggregate
-    is read through ``MAX``, which every row's group allows."""
+    is read through an aggregate, which every row's group allows: ``MIN``
+    for ``-inf``, since DataFusion 55's grouped ``MAX`` of ``-inf`` is
+    ``f64::MIN``, and ``MAX`` otherwise."""
     if isinstance(e, Col):
         return f"{aliases[e.input]}.{e.name}"
     if isinstance(e, Lit):
         if ieee is not None and _nonfinite(e):
             col = f"{ieee}.{_nonfinite_column(e.value)}"
-            return f"MAX({col})" if grouped else col
+            if not grouped:
+                return col
+            return f"MIN({col})" if e.value == -math.inf else f"MAX({col})"
         return literal(e.value, e.dtype)
     if isinstance(e, Agg):
         if e.fn not in AGGREGATES:

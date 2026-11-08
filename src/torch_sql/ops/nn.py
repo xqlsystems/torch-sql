@@ -103,7 +103,10 @@ def native_layer_norm(ctx, x, normalized_shape, weight, bias, eps):
 @op(aten._softmax.default)
 def softmax(ctx, x, dim, half_to_float):
     """``exp(x - max) / sum(exp(x - max))`` along ``dim``. The max is SQL's
-    plain ``MAX``: a NaN makes the whole slice NaN either way."""
+    plain ``MAX``, without ``amax``'s checks, which this doesn't need: a NaN
+    makes the whole slice NaN either way, and so does a slice that is all
+    ``-inf``, though DataFusion's ``MAX`` of it is ``f64::MIN``
+    (:mod:`.reductions`). ``log_softmax`` is the same."""
     dims = set(normalize_dims(dim, x.rank))
     m = grouped(x, dims, "MAX")
     e = elementwise(x.shape, F64, [x, m], lambda v, mx: g.call("exp", v - mx))
