@@ -411,6 +411,12 @@ class Environment:
         return target
 
     def _assign(self, target: Tensor, node: g.Node):
+        if _untracked(target):
+            raise NotImplementedError(
+                "an in-place op that autograd doesn't record (under torch.no_grad(), or "
+                "through .detach() or .data) on a tensor with a grad_fn: PyTorch keeps the "
+                "tensor's gradient, which torch-sql can't yet (design §8.6, issue #18)"
+            )
         if node.shape != target._node.shape:
             raise AssertionError(f"in-place result {node.shape} for {target._node.shape}")
         if node.dtype != target.dtype:
@@ -444,6 +450,23 @@ def _stopped(nodes):
         else n,
         nodes,
     )
+
+
+def _untracked(target: Tensor) -> bool:
+    """Whether writing ``target`` would change the value of a tensor with a
+    history (a ``grad_fn``) without autograd recording the write. PyTorch
+    then keeps the history, so the gradient is the old value's; torch-sql
+    gives the tensor the write's node, which a stop-gradient cuts from it.
+    Autograd records the write only if gradients are enabled and the target
+    is the tensor with the history, not a ``.detach()`` alias of it."""
+    if torch.is_grad_enabled() and target.grad_fn is not None:
+        return False
+    t = target
+    while t is not None:
+        if t.grad_fn is not None:
+            return True
+        t = t._source
+    return False
 
 
 def _requires_grad(args, kwargs) -> bool:

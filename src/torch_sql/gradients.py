@@ -33,7 +33,8 @@ from . import sql
 
 def leaves(loss: torch.Tensor) -> list[torch.Tensor]:
     """The tensors that would accumulate a gradient if PyTorch's autograd
-    ran ``loss.backward()``, in a stable order."""
+    ran ``loss.backward()``, in a stable order. Raises as PyTorch would if
+    a tensor that the backward pass needs was written in place."""
     if loss.grad_fn is None:
         return [loss] if loss.requires_grad else []
     found, seen, stack = [], set(), [loss.grad_fn]
@@ -45,8 +46,27 @@ def leaves(loss: torch.Tensor) -> list[torch.Tensor]:
         variable = getattr(fn, "variable", None)
         if variable is not None:  # an AccumulateGrad node
             found.append(variable)
+        _check_saved(fn)
         stack.extend(next_fn for next_fn, _ in fn.next_functions)
     return found
+
+
+def _check_saved(fn):
+    """PyTorch's own check that no tensor ``fn`` saved for its backward has
+    been written in place since: reading a saved tensor raises "one of the
+    variables needed for gradient computation has been modified by an
+    inplace operation". torch-sql's graph still has the old value, so it
+    could give a gradient there, but code that fails on the CPU shouldn't
+    pass on the device."""
+    names = _SAVED.get(type(fn))
+    if names is None:
+        names = _SAVED[type(fn)] = [a for a in dir(fn) if a.startswith("_saved_")]
+    for name in names:
+        getattr(fn, name)
+
+
+#: The names of the saved tensors of each kind of autograd node.
+_SAVED: dict[type, list[str]] = {}
 
 
 def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=None):
@@ -75,25 +95,42 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
         return
 
     # Each leaf as a table, which ddx differentiates with respect to. The
-    # loss's graph refers to each leaf's node from before the sync.
-    tables, resolve = [], {}
-    for t in targets:
+    # loss's graph refers to each leaf's node from before the sync, or to an
+    # earlier node of the leaf: one that a sync has since replaced with its
+    # table, or a value an in-place write has since replaced.
+    tables, resolve, earlier = [], {}, {}
+    for k, t in enumerate(targets):
         node = t._node
         env.sync(t)
         if any(t._node is other for other in tables):
             raise AssertionError("two leaves share one table; their gradients would mix")
         tables.append(t._node)
         resolve[node.id] = t._node
+        for old in tuple(t._earlier.values()):
+            if env.saved(old) is t._node:
+                resolve[old.id] = t._node
+            else:
+                earlier.setdefault(old.id, k)
     # Each stop-gradient node as a table, which ddx treats as a constant.
-    # Every other node is computed again, so that ddx differentiates it,
-    # even if its value was read before and is saved.
+    # Each earlier value of a leaf that the loss reads as a table of its
+    # own, which ddx also differentiates with respect to: the leaf's
+    # gradient is the sum over all of them, as PyTorch's AccumulateGrad sums
+    # over every use, whichever value it read. Every other node is computed
+    # again, so that ddx differentiates it, even if its value was read
+    # before and is saved.
+    owned = {table.id: (k, table) for k, table in enumerate(tables)}
     stack, seen = [objective._node], set()
     while stack:
         node = stack.pop()
         if node.id in seen or node.id in resolve:
             continue
         seen.add(node.id)
-        if isinstance(node, g.Select) and node.stop_gradient:
+        if node.id in earlier:
+            table = resolve[node.id] = env.materialize(node)
+            k, _ = owned.setdefault(table.id, (earlier[node.id], table))
+            if k != earlier[node.id]:
+                raise AssertionError("two leaves share one table; their gradients would mix")
+        elif isinstance(node, g.Select) and node.stop_gradient:
             resolve[node.id] = env.materialize(node)
         else:
             stack.extend(node.inputs)
@@ -102,7 +139,7 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
         return resolve.get(node.id, node)
 
     reached = {n.id for n in g.topological([objective._node], read) if isinstance(n, g.Table)}
-    wrt = [table for table in tables if table.id in reached]
+    wrt = [table for _, table in owned.values() if table.id in reached]
     grads = {}
     if wrt:
         # SUM over the one row: ddx can then show the loss is one row, which
@@ -122,13 +159,10 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
         for table in wrt:
             name = out.gradients[table.name]
             grads[table.id] = _adopt(env, g.Table(table.shape, table.dtype, name=name))
-    for t, table in zip(targets, tables, strict=True):
-        node = grads.get(table.id)
-        if node is None:  # a leaf the SQL doesn't read: its gradient is 0
-            grad = torch.zeros_like(t)
-        else:
-            grad = Tensor(node, env)
+    for k, t in enumerate(targets):
+        parts = [Tensor(grads[i], env) for i, (j, _) in owned.items() if j == k and i in grads]
         with torch.no_grad():
+            grad = sum(parts[1:], parts[0]) if parts else torch.zeros_like(t)
             t.grad = grad if t.grad is None else t.grad + grad
 
 

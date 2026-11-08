@@ -31,6 +31,7 @@ against.
 from __future__ import annotations
 
 import copy
+import weakref
 
 import torch
 
@@ -86,6 +87,10 @@ class Tensor(torch.Tensor):
         #: The table holding the value of a tensor that keeps its graph
         #: (see Environment.sync).
         t._table = None
+        #: The node last returned as ``_node``, and the earlier ones still
+        #: alive, by id: a leaf's uses may have read any of them, and
+        #: backward() differentiates with respect to each.
+        t._last, t._earlier = None, weakref.WeakValueDictionary()
         if alias_of is None:
             t._storage, t._derive, t._source = Storage(node), None, None
             t._same_values = True
@@ -101,13 +106,18 @@ class Tensor(torch.Tensor):
     def _node(self) -> g.Node:
         """The node holding this tensor's current value."""
         if self._derive is None:
-            return self._storage.node
-        node, source = self._cached
-        current = self._source._node
-        if current is not source:
-            node = self._derive(current)
-            self._cached = (node, current)
-            self._table = None
+            node = self._storage.node
+        else:
+            node, source = self._cached
+            current = self._source._node
+            if current is not source:
+                node = self._derive(current)
+                self._cached = (node, current)
+                self._table = None
+        if node is not self._last:
+            if self._last is not None:
+                self._earlier[self._last.id] = self._last
+            self._last = node
         return node
 
     @_node.setter

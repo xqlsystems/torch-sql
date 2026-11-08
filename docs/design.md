@@ -828,6 +828,19 @@ storage, as in PyTorch. An in-place op on
 Writing through a view that selects or rearranges values (`x[:, 0] += 1`)
 is refused in the first version, with an error. Samudra doesn't need it.
 
+Gradients follow each tensor's history, as in PyTorch, whatever later
+writes do to its value. An in-place op that autograd records (`y.mul_(3)`
+outside `torch.no_grad()`) extends `y`'s history from its old node. A
+leaf's gradient sums over every use of it, whichever value the use read:
+`backward()` differentiates with respect to each earlier node of the leaf
+that the loss reads, as well as the current one (§11.1). Two cases differ
+from PyTorch. A use that *saved* a value later written (`c = w * w`, then
+`w.add_(1)` under `no_grad`) raises PyTorch's own "modified by an inplace
+operation" error, from PyTorch's check of its saved tensors. And an
+in-place op autograd doesn't record (under `no_grad`, or through
+`.detach()`) on a tensor with a `grad_fn` is refused, since torch-sql would
+cut the tensor's history (D17).
+
 ### 8.7 Small constants
 
 A tensor created from Python values (`torch.tensor([0.25, 0.75])`) becomes a
@@ -1527,6 +1540,9 @@ or a profile calls for something else. Each has an issue, labelled
   is too ([#13](https://github.com/xqlsystems/torch-sql/issues/13));
 - writing through a view is refused (§8.6,
   [#14](https://github.com/xqlsystems/torch-sql/issues/14));
+- an in-place op that autograd doesn't record, on a tensor with a
+  `grad_fn`, is refused (§8.6,
+  [#18](https://github.com/xqlsystems/torch-sql/issues/18));
 - at a tie, `maximum` and `minimum` give the gradient to the first
   argument, where PyTorch splits it
   ([#15](https://github.com/xqlsystems/torch-sql/issues/15));
