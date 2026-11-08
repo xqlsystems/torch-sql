@@ -1511,3 +1511,22 @@ torch-sql tensor is a wrapper subclass on PyTorch's `meta` device, so
 `p.device` reads `meta`, not `sql` (§9.1). The alternative, PyTorch's
 private Python-backend setup, is experimental (P5). torch-sql follows
 torchax's choice here, and will revisit it if torchax does.
+
+**D17. Defaults for now, revisited with experience (Alex, 2026-11-08).**
+These choices from the device's first version stand until a model, a user
+or a profile calls for something else. Each has an issue, labelled
+`provisional`, which says what would reopen it:
+- division with a rounding mode is refused
+  ([#12](https://github.com/xqlsystems/torch-sql/issues/12));
+- in-place ops that change a tensor's shape are refused, so 1-D `matmul`
+  is too ([#13](https://github.com/xqlsystems/torch-sql/issues/13));
+- writing through a view is refused (§8.6,
+  [#14](https://github.com/xqlsystems/torch-sql/issues/14));
+- at a tie, `maximum` and `minimum` give the gradient to the first
+  argument, where PyTorch splits it
+  ([#15](https://github.com/xqlsystems/torch-sql/issues/15));
+- random numbers are drawn on the CPU and uploaded, as in DataFusion
+  Accelerated's design (open question 3,
+  [#16](https://github.com/xqlsystems/torch-sql/issues/16));
+- every op runs on the `meta` device before it is lowered
+  ([#17](https://github.com/xqlsystems/torch-sql/issues/17)).
