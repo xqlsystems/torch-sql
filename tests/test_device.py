@@ -68,6 +68,21 @@ def test_module_to_sql(env):
     same(m.weight, w)
 
 
+def test_module_converted_again_on_sql(env):
+    # PyTorch swaps each parameter with a .detach() alias of itself here,
+    # with swap_tensors (§8.6).
+    torch.manual_seed(0)
+    m = torch.nn.Linear(3, 2).double()
+    w = m.weight.detach().clone()
+    m.to("sql")
+    weight = m.weight
+    m.double().to("sql")
+    assert m.weight is weight
+    with torch.no_grad():
+        m.weight.add_(1)
+    same(m.weight, w + 1)
+
+
 def test_module_created_on_sql_matches_the_cpu(env):
     # nn.Linear initializes its weights in place, with uniform_: torch-sql
     # draws on the CPU, so the same seed gives the same weights.
@@ -189,6 +204,23 @@ def test_writing_a_detached_alias_writes_the_base(env):
     x.detach().add_(2)  # as AveragedModel's EMA does
     same(x, torch.full((3,), 2.0, dtype=F64))
     same(tail, torch.full((2,), 2.0, dtype=F64))
+
+
+@pytest.mark.parametrize("how", ["data", "vector_to_parameters"])
+def test_assigning_data(env, how):
+    def program(device):
+        torch.manual_seed(0)
+        model = torch.nn.Linear(2, 2, dtype=F64).to(device)
+        if how == "data":
+            model.weight.data = model.weight.data * 0 + 3
+            model.bias.data = torch.zeros(3, dtype=F64, device=device)
+        else:
+            vector = torch.nn.utils.parameters_to_vector(model.parameters())
+            torch.nn.utils.vector_to_parameters(vector * 2, model.parameters())
+        return [p.detach() for p in model.parameters()]
+
+    for a, b in zip(program("sql"), program("cpu"), strict=True):
+        same(a, b)
 
 
 def test_deepcopy(env):
