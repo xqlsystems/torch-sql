@@ -465,3 +465,60 @@ def test_native_dropout_as_the_cpu_kernel(env, p, train):
     same(got, out)
     assert torch.equal(got_mask.cpu(), mask)
     assert torch.equal(torch.signbit(got.cpu()), torch.signbit(out))
+
+
+ARG_CASES = {
+    "ties": [[1.0, 3.0, 3.0, -1.0], [2.0, 2.0, 0.0, 2.0]],
+    "nan": [[1.0, -NAN, 3.0, NAN], [-INF, -INF, -INF, -INF]],
+    "inf": [[INF, 1.0, INF, 0.0], [-1.0, -INF, -1.0, -2.0]],
+}
+
+
+@pytest.mark.parametrize("case", sorted(ARG_CASES))
+@pytest.mark.parametrize("fn", ["argmax", "argmin", "max", "min"])
+def test_arg_extrema_at_ties_nans_and_infinities(env, case, fn):
+    # PyTorch gives the first index of the extremum, and a NaN is one.
+    x = torch.tensor(ARG_CASES[case], dtype=F64)
+    for kwargs in ({"dim": 1}, {"dim": 0, "keepdim": True}, {}):
+        if fn in ("max", "min") and not kwargs:
+            continue
+        expected = getattr(torch, fn)(x, **kwargs)
+        got = getattr(torch, fn)(x.to("sql"), **kwargs)
+        if fn in ("max", "min"):
+            same(got.values, expected.values)
+            assert torch.equal(got.indices.cpu(), expected.indices), kwargs
+        else:
+            assert torch.equal(got.cpu(), expected), kwargs
+
+
+def test_arg_extrema_of_integers(env):
+    x = torch.tensor([[3, -2, 3], [0, 7, 7]])
+    assert torch.equal(torch.argmax(x.to("sql"), 1).cpu(), torch.argmax(x, 1))
+    assert torch.equal(torch.argmin(x.to("sql")).cpu(), torch.argmin(x))
+
+
+def test_unbind(env):
+    x = torch.arange(12, dtype=F64).view(3, 2, 2)
+    q, k, v = x.to("sql").unbind(0)
+    for got, expected in zip((q, k, v), x.unbind(0), strict=True):
+        same(got, expected)
+
+
+def test_out(env):
+    a = torch.tensor([1.0, 5.0, 3.0], dtype=F64, device="sql")
+    b = torch.tensor([4.0, 2.0, 6.0], dtype=F64, device="sql")
+    head = a[:2]
+    assert torch.maximum(a, b, out=a) is a  # as Adam(amsgrad=True) does
+    same(a, torch.tensor([4.0, 5.0, 6.0], dtype=F64))
+    same(head, torch.tensor([4.0, 5.0], dtype=F64))
+    c = torch.zeros(3, dtype=F64, device="sql")
+    torch.add(a, b, alpha=2, out=c)
+    same(c, torch.tensor([12.0, 9.0, 18.0], dtype=F64))
+
+
+def test_out_of_another_shape_or_through_a_view_is_refused(env):
+    a = torch.ones(3, dtype=F64, device="sql")
+    with pytest.raises(NotImplementedError, match="another shape"):
+        torch.add(a, a, out=torch.zeros(2, 3, dtype=F64, device="sql"))
+    with pytest.raises(NotImplementedError, match="through a view"):
+        torch.add(a[:2], a[:2], out=a[1:])

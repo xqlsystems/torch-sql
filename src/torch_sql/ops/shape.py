@@ -7,7 +7,7 @@ from __future__ import annotations
 import torch
 
 from .. import graph as g
-from . import op
+from . import Context, op
 from ._build import as_dtype
 
 aten = torch.ops.aten
@@ -122,6 +122,13 @@ def select(ctx, x, dim, index):
         index=tuple(g.Col(0, f"i{d}") for d in range(x.rank) if d != dim),
         value=g.Col(0, "v"),
     )
+
+
+@op(aten.unbind.int)
+def unbind(ctx, x, dim=0):
+    """``select`` at each index of ``dim``: ``q, k, v = qkv.unbind(0)``."""
+    dim = dim % x.rank
+    return [select(Context(ctx.func, out, ctx.env), x, dim, k) for k, out in enumerate(ctx.out)]
 
 
 @op(aten.slice.Tensor)
