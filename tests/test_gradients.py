@@ -53,6 +53,9 @@ OPTIMIZERS = {
     "adam-foreach": lambda p: torch.optim.Adam(p, lr=0.01, foreach=True),
     "adamw": lambda p: torch.optim.AdamW(p, lr=0.01, weight_decay=0.1),
     "adamw-foreach": lambda p: torch.optim.AdamW(p, lr=0.01, weight_decay=0.1, foreach=True),
+    # AMSGrad's foreach path calls _foreach_maximum_, and there's no
+    # aten.maximum_.
+    "amsgrad-foreach": lambda p: torch.optim.Adam(p, lr=0.01, amsgrad=True, foreach=True),
 }
 
 
@@ -81,6 +84,35 @@ def test_mlp_trains_as_pytorch_does(env, optimizer):
         for p, r in zip(model.parameters(), ref.parameters(), strict=True):
             close(p.grad, r.grad)
             close(p, r)
+
+
+def test_ema_of_weights(env):
+    # AveragedModel deep-copies the model, then lerps p.detach() in place,
+    # which must reach the averaged parameters (§8.6).
+    from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+
+    def averaged(device):
+        model = mlp()
+        ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.5))
+        if device == "sql":
+            model, ema = model.to("sql"), ema.to("sql")
+        for _ in range(2):
+            with torch.no_grad():
+                for p in model.parameters():
+                    p.add_(1.0)
+            ema.update_parameters(model)
+        return list(ema.module.parameters())
+
+    for p, r in zip(averaged("sql"), averaged("cpu"), strict=True):
+        close(p, r)
+
+
+def test_gradient_of_a_sum_of_an_expand(env):
+    # On DuckDB, ddx mistook arange's unread v for the other input's
+    # (xqlsystems/ddx#266); arange tables now have no v.
+    w = torch.tensor([-1.0], dtype=F64, device="sql").requires_grad_()
+    w.expand(2).sum().backward()
+    close(w.grad, torch.tensor([2.0], dtype=F64))
 
 
 def test_a_step_ends_with_tables(env):

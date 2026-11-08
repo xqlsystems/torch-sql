@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import weakref
 
+import pyarrow as pa
 import torch
 from torch.optim.optimizer import register_optimizer_step_post_hook
 from torch.overrides import TorchFunctionMode
@@ -32,7 +33,7 @@ from ..engines import Engine
 from ..engines import engine as make_engine
 from ..ops import LOWERINGS, Context, OperatorNotFound
 from .functions import FUNCTIONS
-from .tensor import Tensor
+from .tensor import Storage, Tensor
 
 aten = torch.ops.aten
 
@@ -53,6 +54,11 @@ IN_PLACE_VIEWS = {
     aten.as_strided_.default,
     aten.resize_.default,
 }
+
+#: View ops whose result holds the same values as their input, so that an
+#: in-place op on the result writes the input's storage, as
+#: ``p.detach().lerp_(q, w)`` does in PyTorch's EMA of weights.
+SAME_VALUES = {aten.detach.default, aten.alias.default, aten.lift_fresh.default}
 
 #: In-place ops whose functional form isn't named after them.
 FUNCTIONAL = {
@@ -77,7 +83,12 @@ class Environment:
         #: Tables that hold nodes' values, by node id, for nodes already read.
         self._saved: weakref.WeakValueDictionary[int, g.Table] = weakref.WeakValueDictionary()
         self._ranges: dict[int, g.Table] = {}
+        self._points: dict[int, g.Table] = {}
         self._index_tables: dict = {}
+        #: The storage of each tensor created or written since the last
+        #: sync(), by id. Not the tensors: PyTorch can't swap a tensor that
+        #: has a weak reference, as module.to() does.
+        self._pending: weakref.WeakValueDictionary[int, Storage] = weakref.WeakValueDictionary()
         self._mode = _FunctionMode(self)
         self._depth = 0
 
@@ -86,8 +97,14 @@ class Environment:
 
     # -- Activation -------------------------------------------------------
 
+    @staticmethod
+    def active() -> Environment | None:
+        """The innermost active environment, if any."""
+        return _active[-1] if _active else None
+
     def __enter__(self):
         self._mode.__enter__()
+        _active.append(self)
         if self._depth == 0:
             self._hook = register_optimizer_step_post_hook(self._after_step)
             # module.to("sql") must keep each Parameter object, as it does
@@ -100,6 +117,7 @@ class Environment:
         return self
 
     def __exit__(self, *exc):
+        _active.remove(self)
         self._depth -= 1
         if self._depth == 0:
             self._hook.remove()
@@ -154,10 +172,23 @@ class Environment:
         return Tensor(self.upload(cpu.detach()), self, requires_grad=cpu.requires_grad)
 
     def arange(self, n: int) -> g.Table:
-        """The table of ``torch.arange(n)``, registered once."""
+        """A table of the indices ``0`` to ``n - 1``, in its column ``i0``,
+        registered once. It has no value column: a join with it (``expand``)
+        reads only the index, and on DuckDB ddx mistakes an unread ``v``
+        across a cross join for the other input's (xqlsystems/ddx#266)."""
         if n not in self._ranges:
-            self._ranges[n] = self.upload(torch.arange(n))
+            table = g.Table((n,), torch.int64)
+            self.engine.register(table.name, pa.table({"i0": pa.array(range(n), pa.int64())}))
+            self._drop_with(table)
+            self._ranges[n] = table
         return self._ranges[n]
+
+    def point(self, k: int) -> g.Table:
+        """A one-row table whose value is ``k``, registered once: a join
+        with it selects index ``k`` (``select``)."""
+        if k not in self._points:
+            self._points[k] = self.upload(torch.tensor([k]))
+        return self._points[k]
 
     def saved(self, node: g.Node) -> g.Node:
         """The table holding ``node``'s value if one does, else ``node``."""
@@ -179,12 +210,21 @@ class Environment:
 
     def sync(self, *tensors: Tensor) -> None:
         """Run what each tensor's value depends on, and keep it as a table
-        (§9.6). Later queries read the table.
+        (§9.6). Later queries read the table. With no tensors, every tensor
+        still alive that was created or written since the last such call
+        (§7.1).
 
         A leaf (a tensor with no ``grad_fn``: a parameter, optimizer state,
         an input) then *is* its table: its history is no one's business.
         Any other tensor keeps its graph as well, since a later
         ``backward()`` must differentiate through it."""
+        if not tensors:
+            # Each value's table is saved under its node, so later queries
+            # read it, and kept alive by the storage.
+            for storage in tuple(self._pending.values()):
+                storage.table = self.materialize(storage.node)
+            self._pending.clear()
+            return
         for t in tensors:
             table = self.materialize(t._node)
             if t.grad_fn is None:
@@ -229,22 +269,20 @@ class Environment:
             )
         out = self._meta(func, args, kwargs)
         flat, spec = tree_flatten(out)
+        for t in flat:
+            if isinstance(t, torch.Tensor):
+                # A result PyTorch gives in a dtype torch-sql lacks, such as
+                # int / int in float32, is refused before it's lowered.
+                g.check_dtype(t.dtype)
         if flat and all(isinstance(t, torch.Tensor) and t.numel() == 0 for t in flat):
             # A result with no elements is a relation with no rows, whatever
             # the op.
             nodes = tree_unflatten([self.empty(t.shape, t.dtype) for t in flat], spec)
-        else:
-            nodes = lowering(Context(func, out, self), *self._nodes(args), **self._nodes(kwargs))
-        if not torch.is_grad_enabled() and _requires_grad(args, kwargs):
-            # Computed under torch.no_grad() from a tensor that requires a
-            # gradient: a constant to the loss, as in PyTorch (§11.3).
-            nodes = tree_map(
-                lambda n: g.identity(n, stop_gradient=True)
-                if isinstance(n, g.Node) and n.dtype == torch.float64
-                else n,
-                nodes,
-            )
-        return self._wrap(func, out, nodes)
+            return self._wrap(func, out, nodes)
+        stop = not torch.is_grad_enabled() and _requires_grad(args, kwargs)
+        nodes = lowering(Context(func, out, self), *self._nodes(args), **self._nodes(kwargs))
+        aliasing = self._aliasing(func, out, lowering, args, kwargs, stop)
+        return self._wrap(func, out, _stopped(nodes) if stop else nodes, aliasing)
 
     def empty(self, shape, dtype) -> g.Node:
         """A tensor with no elements: no rows."""
@@ -298,7 +336,30 @@ class Environment:
 
         return tree_map(node, tree)
 
-    def _wrap(self, func, out, nodes):
+    def _aliasing(self, func, out, lowering, args, kwargs, stop=False):
+        """For a view op (one whose result aliases its input, §8.6): the
+        input, and a function that lowers the op again from the input's
+        storage's node, giving every result's node."""
+        returns = func._schema.returns
+        if (
+            not returns
+            or returns[0].alias_info is None
+            or not args
+            or not isinstance(args[0], Tensor)
+        ):
+            return None
+        base, parent = args[0], args[0]._derive
+        rest, kw = self._nodes(args[1:]), self._nodes(kwargs)
+
+        def relower(node):
+            if parent is not None:
+                node = parent(node)
+            nodes = lowering(Context(func, out, self), node, *rest, **kw)
+            return tree_flatten(_stopped(nodes) if stop else nodes)[0]
+
+        return base, relower
+
+    def _wrap(self, func, out, nodes, aliasing=None):
         flat, spec = tree_flatten(out)
         produced, _ = tree_flatten(nodes)
         if len(flat) != len(produced):
@@ -316,7 +377,20 @@ class Environment:
                     f"{tuple(meta.shape)} {meta.dtype}"
                 )
             node.hint.setdefault("aten", str(func))
-            wrapped.append(Tensor(node, self, stride=meta.stride()))
+            if aliasing is None:
+                wrapped.append(Tensor(node, self, stride=meta.stride()))
+                continue
+            base, relower = aliasing
+            wrapped.append(
+                Tensor(
+                    node,
+                    self,
+                    stride=meta.stride(),
+                    alias_of=base,
+                    derive=_result(relower, len(wrapped)),
+                    same_values=func in SAME_VALUES,
+                )
+            )
         return tree_unflatten(wrapped, spec)
 
     def _in_place(self, func, args, kwargs):
@@ -367,7 +441,27 @@ class Environment:
                 index=tuple(g.Col(0, c) for c in node.columns),
                 value=as_dtype(g.Col(0, "v"), node.dtype, target.dtype),
             )
-        target._node = node
+        target._write(node)
+
+
+def _result(relower, k):
+    """The function giving result ``k`` of a view op from its base's node."""
+    return lambda node: relower(node)[k]
+
+
+#: The active environments, innermost last.
+_active: list[Environment] = []
+
+
+def _stopped(nodes):
+    """Nodes computed under ``torch.no_grad()`` from a tensor that requires
+    a gradient: constants to the loss, as in PyTorch (§11.3)."""
+    return tree_map(
+        lambda n: g.identity(n, stop_gradient=True)
+        if isinstance(n, g.Node) and n.dtype == torch.float64
+        else n,
+        nodes,
+    )
 
 
 def _requires_grad(args, kwargs) -> bool:
@@ -415,6 +509,11 @@ def _foreach(env: Environment, func, args, kwargs):
     if name == "norm":
         ord_ = next((v for a, v in provided if a.name == "ord"), 2)
         return [aten.linalg_vector_norm(t, ord_) for t in provided[0][1]]
+    # An in-place foreach op whose plain op has no in-place form, such as
+    # _foreach_maximum_ (AMSGrad), applies the functional op and assigns.
+    assign = name.endswith("_") and not hasattr(aten, name)
+    if assign:
+        name = name[:-1]
     packet = getattr(aten, name)
     plain = getattr(packet, _FOREACH_OVERLOADS.get(func._overloadname, func._overloadname), None)
     plain = plain or packet.default
@@ -426,6 +525,11 @@ def _foreach(env: Environment, func, args, kwargs):
         call_args = values[: len(positional)]
         call_kwargs = {a.name: v for a, v in zip(keyword, values[len(positional) :], strict=False)}
         results.append(plain(*call_args, **call_kwargs))
+    if assign:
+        for target, result in zip(provided[0][1], results, strict=True):
+            if target._is_view():
+                raise NotImplementedError(f"{func} writes through a view (design §8.6)")
+            env._assign(target, result._node)
     return None if not schema.returns else results
 
 
@@ -446,6 +550,7 @@ def _to_copy(env: Environment, x, **kwargs):
         dtype = kwargs.get("dtype")
         return cpu.to(dtype) if dtype is not None else cpu
     out = env._meta(aten._to_copy.default, (x,), kwargs)
+    g.check_dtype(out.dtype)
     return env._wrap(
         aten._to_copy.default,
         out,

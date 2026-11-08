@@ -744,7 +744,12 @@ Float64 is the default for verification, because it makes disagreements with
 PyTorch easy to see. Float32 is supported. Integer and boolean tensors are
 supported for indices and masks. bfloat16 and other low-precision types are
 open (§17), since neither SQL engine has them and einfold only handles
-`DOUBLE` today.
+`DOUBLE` today. An op whose result PyTorch gives in an unsupported dtype,
+such as `int / int`, which is float32, is refused with an error.
+
+Integer overflow differs by engine. DataFusion wraps around, as PyTorch
+does, and DuckDB raises an error (`2**62 * 4`, say). Neither gives a
+wrong number silently.
 
 ### 8.3 Existence, sparsity and masks
 
@@ -803,9 +808,20 @@ index columns.
 
 An in-place op such as `fts += skip` replaces the tensor's graph node with a
 new one; the old value stays available to anything that already read it.
-This is how torchax handles in-place ops too. Writing through a view
-(`x[:, 0] += 1`) is refused in the first version, with an error. Samudra
-doesn't need it.
+This is how torchax handles in-place ops too.
+
+A view (`x[:2]`, `x.view(2, 2)`, `x.t()`) and `x.detach()` share their
+base's storage in PyTorch, so they must see an in-place op on it. In
+torch-sql they share a *storage* object, which holds the base's current
+node, and each alias keeps the function that derives its node from it.
+After a write, each alias derives its node again. DataFusion Accelerated's
+table handles work the same way: a query reads a handle's current buffer,
+not the one it was planned against (its design, §5.2). An in-place op on
+`x.detach()` writes `x`'s storage, which is how PyTorch's EMA of weights
+(`AveragedModel`) updates its average.
+
+Writing through a view that selects or rearranges values (`x[:, 0] += 1`)
+is refused in the first version, with an error. Samudra doesn't need it.
 
 ### 8.7 Small constants
 
@@ -1390,7 +1406,9 @@ After M5: the runtime (with others), GPUs, and distribution.
 7. **Cache keys.** Which properties of the graph a cached program must check
    before it is reused (shapes, dtypes, existence, the set of parameters).
    Through the compile backend, Dynamo's guards check most of them.
-8. **The runtime's name and home.**
+8. **The runtime's name and home.** Decided: it is DataFusion Accelerated
+   (`datafusion-accelerated`), a DataFusion extension under xqlsystems for
+   now.
 9. **How much to fall back.** Whether a fallback is allowed per op, per
    module, or per graph, and what the default is.
 10. **Splitting data across ranks.** Whether the co-processor's loader
