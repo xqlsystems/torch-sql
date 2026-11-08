@@ -145,7 +145,9 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
         if loss._node is objective._node:
             loss._table = value
     for k, t in enumerate(targets):
-        parts = [Tensor(grads[i], env) for i, (j, _) in owned.items() if j == k and grads[i] is not None]
+        parts = [
+            Tensor(grads[i], env) for i, (j, _) in owned.items() if j == k and grads[i] is not None
+        ]
         with torch.no_grad():
             grad = sum(parts[1:], parts[0]) if parts else torch.zeros_like(t)
             t.grad = grad if t.grad is None else t.grad + grad
