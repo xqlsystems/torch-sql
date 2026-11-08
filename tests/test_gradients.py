@@ -45,6 +45,8 @@ OPTIMIZERS = {
     # AMSGrad's foreach path calls _foreach_maximum_, and there's no
     # aten.maximum_.
     "amsgrad-foreach": lambda p: torch.optim.Adam(p, lr=0.01, amsgrad=True, foreach=True),
+    # Without foreach, AMSGrad calls torch.maximum(..., out=).
+    "amsgrad": lambda p: torch.optim.Adam(p, lr=0.01, amsgrad=True),
 }
 
 
@@ -337,6 +339,9 @@ DIFFERENTIABLE = [
     "maximum",
     "minimum",
     "amin",
+    "max",
+    "min",
+    "unbind",
 ]
 
 
@@ -366,8 +371,11 @@ def test_op_gradient(engine, info):
             if isinstance(t, torch.Tensor) and t.requires_grad
         ]
         out = info(sample.input, *sample.args, **sample.kwargs)
-        outs = [o for o in tree_flatten(out)[0] if isinstance(o, torch.Tensor)]
-        if not leaves or not outs or any(o.numel() == 0 or not o.requires_grad for o in outs):
+        # The outputs with a gradient: max(x, dim)'s values, not its indices.
+        flat = [o for o in tree_flatten(out)[0] if isinstance(o, torch.Tensor)]
+        differentiable = [o.requires_grad for o in flat]
+        outs = [o for o in flat if o.requires_grad]
+        if not leaves or not outs or any(o.numel() == 0 for o in outs):
             continue
         # Values within 1e-6 of a kink (relu, clamp, abs, maximum) or a tie
         # differ between subgradients; leave those samples out.
@@ -379,6 +387,8 @@ def test_op_gradient(engine, info):
             "minimum",
             "amax",
             "amin",
+            "max",
+            "min",
         } and _near_kink(sample):
             continue
         torch.manual_seed(0)
@@ -400,8 +410,16 @@ def test_op_gradient(engine, info):
             with env:
                 got_outs = [
                     o
-                    for o in tree_flatten(info(args[0], *args[1], **args[2]))[0]
-                    if isinstance(o, torch.Tensor)
+                    for o, d in zip(
+                        (
+                            o
+                            for o in tree_flatten(info(args[0], *args[1], **args[2]))[0]
+                            if isinstance(o, torch.Tensor)
+                        ),
+                        differentiable,
+                        strict=True,
+                    )
+                    if d
                 ]
                 objective = sum(
                     (o * c.to("sql")).sum() for o, c in zip(got_outs, cotangents, strict=True)
