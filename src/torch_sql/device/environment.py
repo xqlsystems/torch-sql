@@ -324,7 +324,7 @@ class Environment:
     def _aliasing(self, func, out, lowering, args, kwargs, stop=False):
         """For a view op (one whose result aliases its input, §8.6): the
         input, and a function that lowers the op again from the input's
-        storage's node, giving every result's node."""
+        current node, giving every result's node."""
         returns = func._schema.returns
         if (
             not returns
@@ -333,16 +333,13 @@ class Environment:
             or not isinstance(args[0], Tensor)
         ):
             return None
-        base, parent = args[0], args[0]._derive
         rest, kw = self._nodes(args[1:]), self._nodes(kwargs)
 
         def relower(node):
-            if parent is not None:
-                node = parent(node)
             nodes = lowering(Context(func, out, self), node, *rest, **kw)
             return tree_flatten(_stopped(nodes) if stop else nodes)[0]
 
-        return base, relower
+        return args[0], relower
 
     def _wrap(self, func, out, nodes, aliasing=None):
         flat, spec = tree_flatten(out)

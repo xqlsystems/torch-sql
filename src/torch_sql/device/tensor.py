@@ -16,9 +16,13 @@ runs until a value is read (:meth:`Tensor.numpy`, ``.item()``, ``.cpu()``,
 **Aliases** (design §8.6). In PyTorch a view (``x[:2]``, ``x.view(2, 2)``)
 and ``x.detach()`` share ``x``'s storage, so an in-place op on one shows
 through the others. Here they share a :class:`Storage`, which holds the
-current node of the tensor that owns it, and each alias keeps the function
-that derives its own node from that one. An in-place op gives the storage a
-new node, and each alias derives its node again the next time it's used.
+current node of the tensor that owns it. Each alias keeps the tensor it was
+taken from (its *base*, as PyTorch's ``._base`` does) and the function that
+derives its own node from the base's. An in-place op gives the storage a new
+node, and each alias derives its node again, from its base's current node,
+the next time it's used. So a chain of aliases (a view of an
+``nn.Parameter``, which is itself an alias) shares one node per value, and
+backward() finds the leaf's node wherever it's read.
 DataFusion Accelerated's table handles work the same way (its design §5.2):
 a query reads a handle's current buffer, not the buffer it was planned
 against.
@@ -34,22 +38,23 @@ from .. import graph as g
 
 
 class Storage:
-    """What a tensor and its aliases share: the owner's current node, a
-    count of the in-place writes to it, and the table that holds its value
-    once ``torch_sql.sync()`` has run it."""
+    """What a tensor and its aliases share: the owner's current node, and
+    the table that holds its value once ``torch_sql.sync()`` has run it."""
 
-    __slots__ = ("node", "version", "table", "__weakref__")
+    __slots__ = ("node", "table", "__weakref__")
 
     def __init__(self, node: g.Node):
-        self.node, self.version, self.table = node, 0, None
+        self.node, self.table = node, None
 
 
 class Tensor(torch.Tensor):
     _storage: Storage
     _env: object
-    #: How this tensor's node follows from its storage's: None for the
-    #: storage's owner, else a function of the owner's node.
+    #: How this tensor's node follows from its base's: None for the
+    #: storage's owner, else a function of the base's node.
     _derive: object
+    #: The tensor this alias was taken from; None for the owner.
+    _source: Tensor | None
     #: Whether this tensor holds the same values as the owner, as
     #: ``.detach()`` does, so an in-place op on it writes the storage.
     _same_values: bool
@@ -82,12 +87,14 @@ class Tensor(torch.Tensor):
         #: (see Environment.sync).
         t._table = None
         if alias_of is None:
-            t._storage, t._derive, t._same_values = Storage(node), None, True
+            t._storage, t._derive, t._source = Storage(node), None, None
+            t._same_values = True
             env._pending[id(t._storage)] = t._storage
         else:
-            t._storage, t._derive = alias_of._storage, derive
+            t._storage, t._derive, t._source = alias_of._storage, derive, alias_of
             t._same_values = same_values and alias_of._same_values
-            t._cached = (node, t._storage.version)
+            # This node, and the base's node it was derived from.
+            t._cached = (node, alias_of._node)
         return t
 
     @property
@@ -95,10 +102,11 @@ class Tensor(torch.Tensor):
         """The node holding this tensor's current value."""
         if self._derive is None:
             return self._storage.node
-        node, version = self._cached
-        if version != self._storage.version:
-            node = self._derive(self._storage.node)
-            self._cached = (node, self._storage.version)
+        node, source = self._cached
+        current = self._source._node
+        if current is not source:
+            node = self._derive(current)
+            self._cached = (node, current)
             self._table = None
         return node
 
@@ -108,7 +116,15 @@ class Tensor(torch.Tensor):
         if self._derive is None:
             self._storage.node = node
         else:
-            self._cached = (node, self._cached[1])
+            self._cached = (node, self._source._node)
+
+    def _adopt(self, other: Tensor):
+        """Share ``other``'s storage from now on, as ``p.data = other``
+        makes ``p`` do in PyTorch."""
+        self._storage, self._derive, self._source = other._storage, other._derive, other._source
+        self._same_values = other._same_values
+        if other._derive is not None:
+            self._cached = other._cached
 
     def _write(self, node: g.Node):
         """An in-place op's result: a new value, which every alias sees."""
@@ -118,7 +134,6 @@ class Tensor(torch.Tensor):
                 "(design §8.6)"
             )
         self._storage.node = node
-        self._storage.version += 1
         self._table = None
         self._storage.table = None
         self._env._pending[id(self._storage)] = self._storage
@@ -132,6 +147,20 @@ class Tensor(torch.Tensor):
                     raise RuntimeError("an op on tensors from two torch-sql environments")
                 env = a._env
         return env.dispatch(func, types, args, kwargs or {})
+
+    @property
+    def data(self):
+        return torch.Tensor.data.__get__(self)
+
+    @data.setter
+    def data(self, value):
+        """``p.data = t``: PyTorch swaps ``p``'s shape and dtype for ``t``'s
+        (``set_data``); ``p`` takes ``t``'s storage as well.
+        ``torch.nn.utils.vector_to_parameters`` assigns this way."""
+        if not isinstance(value, Tensor) or value._env is not self._env:
+            raise RuntimeError("p.data = t needs t on the same torch-sql environment as p")
+        torch.Tensor.data.__set__(self, value)
+        self._adopt(value)
 
     @property
     def is_meta(self):
