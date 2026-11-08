@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 from harness import make_engine, refusals_are_skips
-from hypothesis import assume, given, note
+from hypothesis import given, note
 from hypothesis import strategies as st
 
 import torch_sql
@@ -45,8 +45,6 @@ def optimizers(draw):
 def test_training_matches_pytorch(engine, optimizer, steps, clip, budget, seed):
     kind, kwargs = optimizer
     note(f"{kind}({kwargs}), clip={clip}")
-    # A known finding, pinned below: look past it to find new ones.
-    assume(not (kwargs.get("amsgrad") and kwargs["foreach"]))
     if engine == "duckdb" and budget != "default":
         budget = None
 
@@ -80,14 +78,12 @@ def test_training_matches_pytorch(engine, optimizer, steps, clip, budget, seed):
             )
 
 
-@pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="_foreach_maximum_ has no in-place aten.maximum_")
 @pytest.mark.parametrize("engine", sorted(engines.ENGINES))
 def test_adam_amsgrad_foreach(engine):
     """``Adam(amsgrad=True, foreach=True)`` calls ``_foreach_maximum_``. The
-    one rule for ``_foreach_*`` ops (spike S5) looks up the in-place plain
-    op, ``aten.maximum_``, which doesn't exist, and raises AttributeError,
-    not OperatorNotFound. Spike S5 traced Adam without amsgrad."""
+    one rule for ``_foreach_*`` ops (spike S5) used to look up the in-place
+    plain op, ``aten.maximum_``, which doesn't exist, and raised
+    AttributeError."""
     with torch_sql.Environment(make_engine(engine)):
         torch.manual_seed(0)
         model = torch.nn.Linear(2, 1).double().to("sql")

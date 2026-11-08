@@ -68,23 +68,12 @@ def make_engine(name: str, budget="default") -> engines.Engine:
 #: ones: (engine, the start of the error's message, an op the program must
 #: use). Each has a pinned test in test_fuzz_device.py; remove its entry here
 #: when it's fixed. Set ``TORCH_SQL_FUZZ_KNOWN=0`` to see them all again.
-KNOWN = [
-    ("duckdb", "Out of Range Error: input value", {"sin", "cos"}),
-    ("datafusion", "a tensor of shape () needs 1 rows; the table has 2", {"select"}),
-    ("duckdb", "not a scalar loss", {"expand"}),
-]
+KNOWN: list[tuple[str, str, set[str]]] = []
 
 
 #: Known wrong values: (engine, ops, why). A program that uses one of the
 #: ops and computes a NaN anywhere is skipped on that engine.
-KNOWN_NAN = [
-    ("datafusion", {"relu", "maximum"}, "DataFusion orders a negative NaN below every number"),
-    (
-        "datafusion",
-        {"reduce_amax", "reduce_amin"},
-        "DataFusion's grouped MAX of -inf is f64::MIN",
-    ),
-]
+KNOWN_NAN: list[tuple[str, set[str], str]] = []
 
 
 def _known_nan(program: Program, engine: str, values) -> str | None:

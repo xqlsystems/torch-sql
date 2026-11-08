@@ -110,20 +110,15 @@ def monkeypatch_rows(monkeypatch):
     return install
 
 
-# -- Pinned findings ---------------------------------------------------------
-# Each was found by the tests above and shrunk by hand.
+# -- Fixed findings ----------------------------------------------------------
+# Each was found by the tests above, shrunk by hand, and fixed in the stack.
+# They stay as regression tests. Each docstring says what used to happen.
 
 
-@pytest.mark.pinned
 @pytest.mark.parametrize(
     "engine",
     [
-        pytest.param(
-            "datafusion",
-            marks=pytest.mark.xfail(
-                strict=True, reason="DataFusion orders a negative NaN below every number"
-            ),
-        ),
+        "datafusion",
         "duckdb",
     ],
 )
@@ -142,8 +137,6 @@ def test_negative_nan_stays_nan(engine, fn):
         assert torch.isnan(out.cpu()).all(), f"{fn}(0/0) = {out.cpu().tolist()}"
 
 
-@pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="an in-place op doesn't reach the tensor's aliases")
 @pytest.mark.parametrize("engine", ENGINES)
 @pytest.mark.parametrize("alias", ["slice", "detach", "view"])
 def test_writing_a_tensor_updates_its_aliases(engine, alias):
@@ -164,8 +157,6 @@ def test_writing_a_tensor_updates_its_aliases(engine, alias):
     assert torch.equal(got, expected), f"{alias}: got {got.tolist()}, PyTorch {expected.tolist()}"
 
 
-@pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="an in-place op doesn't reach the tensor's aliases")
 @pytest.mark.parametrize("engine", ENGINES)
 def test_ema_of_weights_updates(engine):
     """The same finding, through PyTorch's own EMA, which Samudra's optimizer
@@ -195,8 +186,6 @@ def test_ema_of_weights_updates(engine):
         torch.testing.assert_close(a, b)
 
 
-@pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="DuckDB's sin and cos raise on an infinity")
 @pytest.mark.parametrize("fn", ["sin", "cos"])
 def test_trig_of_infinity_is_nan(fn):
     """PyTorch's sin(inf) and cos(inf) are NaN. DuckDB raises an
@@ -210,16 +199,10 @@ def test_trig_of_infinity_is_nan(fn):
     assert torch.isnan(out[0]) and out[1] == getattr(math, fn)(1.0)
 
 
-@pytest.mark.pinned
 @pytest.mark.parametrize(
     "engine",
     [
-        pytest.param(
-            "datafusion",
-            marks=pytest.mark.xfail(
-                strict=True, reason="DataFusion pushes a filter below an ungrouped aggregate"
-            ),
-        ),
+        "datafusion",
         "duckdb",
     ],
 )
@@ -267,14 +250,10 @@ def test_backward_twice_accumulates(engine, program):
         close(a, 3 * b, max(1.0, scale([b])) * 3, f"accumulated gradient of leaf {k}")
 
 
-@pytest.mark.pinned
 @pytest.mark.parametrize(
     "engine",
     [
-        pytest.param(
-            "datafusion",
-            marks=pytest.mark.xfail(strict=True, reason="DataFusion's grouped MAX of -inf"),
-        ),
+        "datafusion",
         "duckdb",
     ],
 )
@@ -292,15 +271,11 @@ def test_amax_of_infinities(engine):
         assert (-x).amin(1).cpu().tolist() == [math.inf, math.inf]
 
 
-@pytest.mark.pinned
 @pytest.mark.parametrize(
     "engine",
     [
         "datafusion",
-        pytest.param(
-            "duckdb",
-            marks=pytest.mark.xfail(strict=True, reason="ddx raises NotScalar on DuckDB"),
-        ),
+        "duckdb",
     ],
 )
 def test_gradient_of_a_sum_of_an_expand(engine):
