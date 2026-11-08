@@ -93,6 +93,11 @@ OPS = [
     "nn.functional.scaled_dot_product_attention",
     "nn.functional.gelu",
     "tril",
+    "argmax",
+    "argmin",
+    "max",
+    "min",
+    "unbind",
 ]
 
 #: (op, why) for samples torch-sql refuses on purpose. Each refusal raises
