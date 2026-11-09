@@ -2,6 +2,7 @@
 
 import gc
 import math
+import weakref
 
 import pytest
 import torch
@@ -551,3 +552,18 @@ def test_addmm_with_beta_zero_ignores_the_bias(env):
     a = torch.eye(2, dtype=F64, device="sql")
     same(torch.addmm(bias, a, a, beta=0), torch.eye(2, dtype=F64))
     same(torch.addmm(bias, a, a, beta=0, alpha=3), 3 * torch.eye(2, dtype=F64))
+
+
+def test_an_output_autograd_saves_is_freed(engine):
+    # exp saves its output, as a .detach() of it, in its backward node. An
+    # alias that held its base would make a cycle through autograd's C++
+    # graph, and the output, its environment and its engine would never be
+    # freed.
+    with torch_sql.Environment(engine):
+        x = torch.randn(3, dtype=F64, device="sql", requires_grad=True)
+        y = x.exp().tanh()
+        v = x.view(3).exp()
+        refs = [weakref.ref(t) for t in (y, v)]
+        del x, y, v
+    gc.collect()
+    assert all(r() is None for r in refs)

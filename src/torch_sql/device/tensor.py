@@ -17,13 +17,13 @@ runs until a value is read (:meth:`Tensor.numpy`, ``.item()``, ``.cpu()``,
 **Aliases** (design §8.6). In PyTorch a view (``x[:2]``, ``x.view(2, 2)``)
 and ``x.detach()`` share ``x``'s storage, so an in-place op on one shows
 through the others. Here they share a :class:`Storage`, which holds the
-current node of the tensor that owns it. Each alias keeps the tensor it was
-taken from (its *base*, as PyTorch's ``._base`` does) and the function that
-derives its own node from the base's. An in-place op gives the storage a new
-node, and each alias derives its node again, from its base's current node,
-the next time it's used. So a chain of aliases (a view of an
-``nn.Parameter``, which is itself an alias) shares one node per value, and
-backward() finds the leaf's node wherever it's read.
+current node of the tensor that owns it. Each alias keeps the *lineage* of
+the tensor it was taken from (its *base*): how the base finds its node, and
+the function that derives the alias's node from the base's. An in-place op
+gives the storage a new node, and each alias derives its node again, from
+its base's current node, the next time it's used. So a chain of aliases (a
+view of an ``nn.Parameter``, which is itself an alias) shares one node per
+value, and backward() finds the leaf's node wherever it's read.
 DataFusion Accelerated's table handles work the same way (its design §5.2):
 a query reads a handle's current buffer, not the buffer it was planned
 against.
@@ -52,17 +52,46 @@ class Storage:
         self.node, self.table = node, None
 
 
+class Lineage:
+    """How a tensor finds its node: the storage's, for the tensor that owns
+    the storage, or for an alias, a function of its base's node.
+
+    An alias keeps its base's lineage, never the base tensor. PyTorch's
+    autograd saves a ``.detach()`` of an op's output (``exp``, ``tanh``) in
+    the op's backward node, so an alias that held the output would close a
+    cycle through autograd's C++ graph, which Python's garbage collector
+    can't see and so never frees."""
+
+    __slots__ = ("storage", "derive", "base", "cached", "same_values")
+
+    def __init__(self, storage: Storage, derive=None, base: Lineage | None = None, node=None):
+        self.storage, self.derive, self.base = storage, derive, base
+        #: Whether the tensor holds the same values as the owner, as
+        #: ``.detach()`` does, so an in-place op on it writes the storage.
+        self.same_values = base is None
+        #: An alias's node, and the base's node it was derived from.
+        self.cached = None if base is None else (node, base.node())
+
+    def node(self) -> g.Node:
+        if self.base is None:
+            return self.storage.node
+        node, source = self.cached
+        current = self.base.node()
+        if current is not source:
+            node = self.derive(current)
+            self.cached = (node, current)
+        return node
+
+    def set(self, node: g.Node):
+        if self.base is None:
+            self.storage.node = node
+        else:
+            self.cached = (node, self.base.node())
+
+
 class Tensor(torch.Tensor):
-    _storage: Storage
     _env: object
-    #: How this tensor's node follows from its base's: None for the
-    #: storage's owner, else a function of the base's node.
-    _derive: object
-    #: The tensor this alias was taken from; None for the owner.
-    _source: Tensor | None
-    #: Whether this tensor holds the same values as the owner, as
-    #: ``.detach()`` does, so an in-place op on it writes the storage.
-    _same_values: bool
+    _lineage: Lineage
 
     # Every function goes straight to __torch_dispatch__, below autograd.
     __torch_function__ = torch._C._disabled_torch_function_impl
@@ -89,47 +118,36 @@ class Tensor(torch.Tensor):
         )
         t._env = env
         if alias_of is None:
-            t._storage, t._derive, t._source = Storage(node), None, None
-            t._same_values = True
+            t._lineage = Lineage(Storage(node))
             env._pending[id(t._storage)] = t._storage
         else:
-            t._storage, t._derive, t._source = alias_of._storage, derive, alias_of
-            t._same_values = same_values and alias_of._same_values
-            # This node, and the base's node it was derived from.
-            t._cached = (node, alias_of._node)
+            base = alias_of._lineage
+            t._lineage = Lineage(base.storage, derive, base, node)
+            t._lineage.same_values = same_values and base.same_values
         return t
+
+    @property
+    def _storage(self) -> Storage:
+        return self._lineage.storage
 
     @property
     def _node(self) -> g.Node:
         """The node holding this tensor's current value."""
-        if self._derive is None:
-            return self._storage.node
-        node, source = self._cached
-        current = self._source._node
-        if current is not source:
-            node = self._derive(current)
-            self._cached = (node, current)
-        return node
+        return self._lineage.node()
 
     @_node.setter
     def _node(self, node: g.Node):
         """A node with the same value, such as the table that holds it."""
-        if self._derive is None:
-            self._storage.node = node
-        else:
-            self._cached = (node, self._source._node)
+        self._lineage.set(node)
 
     def _adopt(self, other: Tensor):
         """Share ``other``'s storage from now on, as ``p.data = other``
         makes ``p`` do in PyTorch."""
-        self._storage, self._derive, self._source = other._storage, other._derive, other._source
-        self._same_values = other._same_values
-        if other._derive is not None:
-            self._cached = other._cached
+        self._lineage = other._lineage
 
     def _write(self, node: g.Node):
         """An in-place op's result: a new value, which every alias sees."""
-        if not self._same_values:
+        if not self._lineage.same_values:
             raise NotImplementedError(
                 "an in-place op writes through a view, which torch-sql doesn't support "
                 "(design §8.6)"
