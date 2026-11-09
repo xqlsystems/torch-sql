@@ -12,6 +12,7 @@ import types
 
 import torch
 
+from . import tensor
 from .environment import Environment
 from .tensor import Tensor
 
@@ -20,6 +21,7 @@ __all__ = ["Environment", "Tensor"]
 
 def _register():
     if torch._C._get_privateuse1_backend_name() == "sql":
+        tensor._SQL = torch.device("sql")
         return
     torch.utils.rename_privateuse1_backend("sql")
     module = types.ModuleType("torch.sql")
@@ -31,6 +33,7 @@ def _register():
     module._is_in_bad_fork = lambda: False
     module.manual_seed_all = lambda seed: None
     torch._register_device_module("sql", module)
+    tensor._SQL = torch.device("sql")
 
 
 _register()

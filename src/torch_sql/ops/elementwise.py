@@ -170,19 +170,28 @@ def _pow(v, p):
 
 @op(aten.pow.Tensor_Scalar)
 def pow_tensor_scalar(ctx, x, p):
+    _pow_floats(ctx)
     shape, dtype = out_of(ctx)
+    return elementwise(shape, dtype, [x], lambda v: _pow(v, scalar(p, dtype)))
+
+
+def _pow_floats(ctx):
+    # SQL's power() works in DOUBLE, which rounds an integer power above
+    # 2**53 (3**39 comes out 11 short).
+    _, dtype = out_of(ctx)
     if dtype not in FLOATS:
         raise NotImplementedError(f"pow of {dtype} tensors")
-    return elementwise(shape, dtype, [x], lambda v: _pow(v, scalar(p, dtype)))
 
 
 @op(aten.pow.Tensor_Tensor)
 def pow_tensor_tensor(ctx, x, p):
+    _pow_floats(ctx)
     return binary(ctx, x, p, lambda v, q: g.call("power", v, q))
 
 
 @op(aten.pow.Scalar)
 def pow_scalar(ctx, base, x):
+    _pow_floats(ctx)
     return unary(ctx, x, lambda v: g.call("power", scalar(base, ctx.out.dtype), v))
 
 
