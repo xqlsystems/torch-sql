@@ -111,7 +111,6 @@ class Environment:
             # PyTorch keeps the object only when it swaps tensors.
             self._swap = torch.__future__.get_swap_module_params_on_conversion()
             torch.__future__.set_swap_module_params_on_conversion(True)
-            self._swap_tensors, torch.utils.swap_tensors = torch.utils.swap_tensors, _swap_tensors
         self._depth += 1
         return self
 
@@ -128,7 +127,6 @@ class Environment:
         if self._depth == 0:
             self._hook.remove()
             torch.__future__.set_swap_module_params_on_conversion(self._swap)
-            torch.utils.swap_tensors = self._swap_tensors
         return self._mode.__exit__(*exc)
 
     def _after_step(self, optimizer, args, kwargs):
@@ -475,27 +473,6 @@ class Environment:
                 value=as_dtype(g.Col(0, "v"), node.dtype, target.dtype),
             )
         target._write(node)
-
-
-def _swap_tensors(t1, t2):
-    """``torch.utils.swap_tensors``, which swaps two tensors' contents,
-    attributes included. ``load_state_dict`` and ``module.to()`` swap a
-    parameter with an alias of it (``Parameter(p.detach())``), whose chain
-    of bases (§8.6) then leads back to itself. Each base in either chain
-    that was one of the two tensors is now the other."""
-    _original_swap_tensors(t1, t2)
-    seen = set()
-    for t in (t1, t2):
-        while isinstance(t, Tensor) and id(t) not in seen:
-            seen.add(id(t))
-            if t._source is t1:
-                t._source = t2
-            elif t._source is t2:
-                t._source = t1
-            t = t._source
-
-
-_original_swap_tensors = torch.utils.swap_tensors
 
 
 def _functional_of(func):
