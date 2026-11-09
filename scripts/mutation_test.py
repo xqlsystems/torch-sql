@@ -4,7 +4,8 @@ Each *mutant* is one exact text replacement in the source, a small change
 that gives wrong numbers (or should give an error) without crashing. For
 each one the script applies it, runs the unit tests and then the
 property-based tests in ``tests/fuzz``, and records which suite, if any,
-*kills* it (fails). A mutant that survives both shows a blind spot.
+*kills* it (fails, or runs past ``MUTANT_TIMEOUT`` seconds). A mutant that
+survives both shows a blind spot.
 
 As in ddx's ``.github/scripts/mutation_test.py``:
 
@@ -162,8 +163,9 @@ MUTANTS = [
 ]
 
 
-def run(args: list[str], timeout: int) -> tuple[bool, float]:
-    """Whether ``pytest args`` passed, and how long it took."""
+def run(args: list[str], timeout: int) -> tuple[str, float]:
+    """Whether ``pytest args`` passed, failed or timed out, and how long it
+    took."""
     start = time.monotonic()
     try:
         proc = subprocess.run(
@@ -185,10 +187,12 @@ def run(args: list[str], timeout: int) -> tuple[bool, float]:
             timeout=timeout,
             env={**os.environ, "HYPOTHESIS_PROFILE": os.environ.get("HYPOTHESIS_PROFILE", "ci")},
         )
-        ok = proc.returncode == 0
+        outcome = "passed" if proc.returncode == 0 else "failed"
     except subprocess.TimeoutExpired:
-        ok = True  # nothing failed in time
-    return ok, time.monotonic() - start
+        # A mutant that hangs the suite is a bug the suite noticed; a
+        # baseline that does can't show anything.
+        outcome = "timed out"
+    return outcome, time.monotonic() - start
 
 
 def _restoring(path: Path, original: str):
@@ -210,9 +214,9 @@ def main(names: list[str]) -> int:
     chosen = [m for m in MUTANTS if not names or m.name in names]
     print("baseline ...", file=sys.stderr)
     for suite in (UNIT, FUZZ):
-        ok, _ = run(suite, timeout)
-        if not ok:
-            print(f"the baseline fails: pytest {' '.join(suite)}", file=sys.stderr)
+        outcome, _ = run(suite, timeout)
+        if outcome != "passed":
+            print(f"the baseline {outcome}: pytest {' '.join(suite)}", file=sys.stderr)
             return 2
     rows, survived = [], 0
     for m in chosen:
@@ -225,21 +229,25 @@ def main(names: list[str]) -> int:
         try:
             path.write_text(original.replace(m.old, m.new))
             print(f"{m.name} ...", file=sys.stderr)
-            unit_ok, unit_t = run(UNIT, timeout)
-            fuzz_ok, fuzz_t = run(FUZZ, timeout)
+            unit, unit_t = run(UNIT, timeout)
+            fuzz, fuzz_t = run(FUZZ, timeout)
         finally:
             path.write_text(original)
             signal.signal(signal.SIGTERM, previous)
-        if not unit_ok and not fuzz_ok:
+        if unit != "passed" and fuzz != "passed":
             status = "killed by both"
-        elif not unit_ok:
+        elif unit != "passed":
             status = "killed by unit tests only"
-        elif not fuzz_ok:
+        elif fuzz != "passed":
             status = "killed by fuzz tests only"
         else:
             status = "SURVIVED"
             survived += 1
-        rows.append((m, status, f"{unit_t:.0f}s", f"{fuzz_t:.0f}s"))
+        timing = [
+            f"{t:.0f}s" + (" (timed out)" if outcome == "timed out" else "")
+            for outcome, t in ((unit, unit_t), (fuzz, fuzz_t))
+        ]
+        rows.append((m, status, *timing))
     print("| mutant | what it breaks | result | unit | fuzz |")
     print("|---|---|---|---|---|")
     for m, status, ut, ft in rows:
