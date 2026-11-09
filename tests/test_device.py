@@ -614,3 +614,12 @@ def test_an_output_autograd_saves_is_freed(engine):
         del x, y, v
     gc.collect()
     assert all(r() is None for r in refs)
+
+
+def test_in_place_foreach_of_a_dtype_pytorch_refuses(env):
+    # PyTorch's checks of the call run for every way of writing a tensor.
+    a = [torch.tensor([1, 2], device="sql")]
+    b = [torch.tensor([2.5, 0.5], dtype=F64, device="sql")]
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch._foreach_maximum_(a, b)
+    same(a[0], torch.tensor([1, 2]))
