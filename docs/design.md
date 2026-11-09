@@ -744,7 +744,12 @@ Float64 is the default for verification, because it makes disagreements with
 PyTorch easy to see. Float32 is supported. Integer and boolean tensors are
 supported for indices and masks. bfloat16 and other low-precision types are
 open (§17), since neither SQL engine has them and einfold only handles
-`DOUBLE` today.
+`DOUBLE` today. An op whose result PyTorch gives in an unsupported dtype,
+such as `int / int`, which is float32, is refused with an error.
+
+Integer overflow differs by engine. DataFusion wraps around, as PyTorch
+does, and DuckDB raises an error (`2**62 * 4`, say). Neither gives a
+wrong number silently.
 
 ### 8.3 Existence, sparsity and masks
 
@@ -803,9 +808,33 @@ index columns.
 
 An in-place op such as `fts += skip` replaces the tensor's graph node with a
 new one; the old value stays available to anything that already read it.
-This is how torchax handles in-place ops too. Writing through a view
-(`x[:, 0] += 1`) is refused in the first version, with an error. Samudra
-doesn't need it.
+This is how torchax handles in-place ops too. An op with `out=`
+(`torch.maximum(a, b, out=a)`, which `Adam(amsgrad=True)` calls) is the
+same: the op without `out=`, whose result replaces `out`'s node. PyTorch
+resizes an `out=` of another shape; torch-sql refuses it. PyTorch's own
+checks of the `out=` call run first, so a cast it refuses (a `float64`
+result into an `int64` `out=`) raises, as in PyTorch.
+
+A view (`x[:2]`, `x.view(2, 2)`, `x.t()`) and `x.detach()` share their
+base's storage in PyTorch, so they must see an in-place op on it. In
+torch-sql they share a *storage* object, which holds the owner's current
+node. Each alias keeps the function that derives its node from the node of
+the tensor it was taken from (its base), and how that tensor finds its own
+node, but not the tensor itself. PyTorch's autograd saves a `.detach()` of
+an op's output, so an alias holding the output would make a reference cycle
+through autograd's C++ graph, which Python never frees. After a write, each
+alias derives its node again, from its base's current node, so a chain of
+aliases (a view of an `nn.Parameter`, itself an alias of the tensor it
+wraps) shares one node per value. DataFusion Accelerated, the planned DataFusion extension that
+runs plans on accelerators (open question 8), has table handles that work
+the same way: a query reads a handle's current buffer, not the one it was
+planned against (its design, §5.2). `p.data = t` makes `p` share `t`'s
+storage, as in PyTorch. An in-place op on
+`x.detach()` writes `x`'s storage, which is how PyTorch's EMA of weights
+(`AveragedModel`) updates its average.
+
+Writing through a view that selects or rearranges values (`x[:, 0] += 1`)
+is refused in the first version, with an error. Samudra doesn't need it.
 
 ### 8.7 Small constants
 
@@ -831,8 +860,12 @@ process, in C++, because PyTorch finds no device guard for it. PyTorch's
 `torch.utils.backend_registration._setup_privateuseone_for_python_backend`
 registers one from Python, and then autograd, checkpointing and
 `torch.compile` all work. It is experimental and private, against the spirit
-of P5. Allocating on `meta`, as torchax does, needs neither, at the cost of
-`p.device` not reading `"sql"`. Which to use is open question 11 (§17).
+of P5. Allocating on `meta`, as torchax does, needs neither. torch-sql
+allocates on `meta`, as torchax does (D16). PyTorch's C++ code sees `meta`,
+but `torch_sql.Tensor` overrides the Python `device` property to read
+`"sql"`. So code that makes a tensor on another tensor's device
+(`torch.zeros(n, device=x.device)`, `t.to(x.device)`) makes a torch-sql
+tensor, and `device="meta"` keeps meaning PyTorch's meta device.
 - An `Environment` holds a `TorchFunctionMode`, a `TorchDispatchMode` and the
   op table. While it is active, every op on a `"sql"` tensor, and every op that
   creates one, goes through `Environment.dispatch`.
@@ -1390,16 +1423,16 @@ After M5: the runtime (with others), GPUs, and distribution.
 7. **Cache keys.** Which properties of the graph a cached program must check
    before it is reused (shapes, dtypes, existence, the set of parameters).
    Through the compile backend, Dynamo's guards check most of them.
-8. **The runtime's name and home.**
+8. **The runtime's name and home.** Decided: it is DataFusion Accelerated
+   (`datafusion-accelerated`), a DataFusion extension under xqlsystems for
+   now.
 9. **How much to fall back.** Whether a fallback is allowed per op, per
    module, or per graph, and what the default is.
 10. **Splitting data across ranks.** Whether the co-processor's loader
     reproduces Samudra's sampler exactly (same windows on the same rank), or
     may choose its own split, for example by Zarr chunk.
-11. **How to register the device.** PyTorch's private Python-backend setup,
-    which makes `p.device` read `"sql"`, or the `meta` device, as torchax
-    does (§9.1). The first is experimental; the second is public but
-    reports the wrong device.
+11. **How to register the device.** Decided: the `meta` device, as torchax
+    does (D16).
 12. **Pooling a partial tensor.** Whether an average pool over a coastline
     averages only its ocean children, or counts land as zero. Like open
     question 1, this changes the model.
@@ -1488,3 +1521,28 @@ that function (ddx#251).
 three ConvNeXt blocks as one query is 136,107 operators (spike S8). torch-sql
 saves the input of every norm, and every other value read more than once, as
 a table between plans (§9.6).
+
+**D16. Allocate on `meta`, as torchax does (Alex, 2026-11-08).** A
+torch-sql tensor is a wrapper subclass on PyTorch's `meta` device. Its
+Python `device` property reads `sql` (§9.1). The alternative, PyTorch's
+private Python-backend setup, is experimental (P5). torch-sql follows
+torchax's choice here, and will revisit it if torchax does.
+
+**D17. Defaults for now, revisited with experience (Alex, 2026-11-08).**
+These choices from the device's first version stand until a model, a user
+or a profile calls for something else. Each has an issue, labelled
+`provisional`, which says what would reopen it:
+- division with a rounding mode is refused
+  ([#12](https://github.com/xqlsystems/torch-sql/issues/12));
+- in-place ops that change a tensor's shape are refused, so 1-D `matmul`
+  is too ([#13](https://github.com/xqlsystems/torch-sql/issues/13));
+- writing through a view is refused (§8.6,
+  [#14](https://github.com/xqlsystems/torch-sql/issues/14));
+- at a tie, `maximum` and `minimum` give the gradient to the first
+  argument, where PyTorch splits it
+  ([#15](https://github.com/xqlsystems/torch-sql/issues/15));
+- random numbers are drawn on the CPU and uploaded, as in DataFusion
+  Accelerated's design (open question 3,
+  [#16](https://github.com/xqlsystems/torch-sql/issues/16));
+- every op runs on the `meta` device before it is lowered
+  ([#17](https://github.com/xqlsystems/torch-sql/issues/17)).

@@ -35,11 +35,16 @@ uv run ruff check && uv run ruff format --check
 On NixOS, first put `libstdc++` and `zlib` on `LD_LIBRARY_PATH`, as the XQL
 repositories' `flake.nix` files do.
 
-The code follows the [package layout](docs/design.md#15-package-layout) of
-the design. What exists so far:
+## Example
 
-- `torch_sql.graph`: the recorded graph, a small relational IR (§9.2);
-- `torch_sql.sql`: writes portable SQL from the graph;
-- `torch_sql.engines`: DataFusion and DuckDB, and ddx's gradient programs on
-  each (§12.1);
-- `torch_sql.boundary.layout`: dense tensors to long tables and back (§6.6).
+A two-layer MLP on `device="sql"`, run on DuckDB:
+
+```python
+import torch, torch_sql
+
+with torch_sql.Environment("duckdb"):
+    mlp = torch.nn.Sequential(torch.nn.Linear(3, 5), torch.nn.Tanh(), torch.nn.Linear(5, 2))
+    mlp = mlp.double().to("sql")
+    y = mlp(torch.randn(4, 3, dtype=torch.float64, device="sql"))
+    print(y)  # runs one SQL query on DuckDB
+```
