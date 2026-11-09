@@ -9,13 +9,13 @@ dependencies = [
     "torch>=2.15",
     "numpy>=1.26",
     "pyarrow>=21",
-    "ddxdb>=0.4.6,<0.5",
+    "ddxdb>=0.4.7,<0.5",
 ]
 
 [project.optional-dependencies]
 # The engines (design §12.3). At least one is needed to run anything.
-datafusion = ["ddxdb[datafusion]>=0.4.6,<0.5"]
-duckdb = ["ddxdb[duckdb]>=0.4.6,<0.5"]
+datafusion = ["ddxdb[datafusion]>=0.4.7,<0.5"]
+duckdb = ["ddxdb[duckdb]>=0.4.7,<0.5"]
 
 [dependency-groups]
 dev = [

@@ -51,15 +51,15 @@ wheels = [
 
 [[package]]
 name = "ddxdb"
-version = "0.4.6"
+version = "0.4.7"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c5/c5/4686763129891af93e874715b8d6a16c2b648a635784de78b3bdb9d6fcae/ddxdb-0.4.6.tar.gz", hash = "sha256:0d90e2bcafc1af70603409d435b5acb49f3627bbb94a5e221d2ed6fe251f0025", size = 372931, upload-time = "2026-10-29T23:35:22.348Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/23/3b/ef8d6581df9ef8847b5a5ad923805ee0aa80b6f8d62bbf04e86a9e15a06b/ddxdb-0.4.7.tar.gz", hash = "sha256:432cfe817ccdc72998a559b60c77f1e440fc4049b92137f66bf9025b19e5aac4", size = 389953, upload-time = "2026-11-07T00:43:59.572Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/eb/8a/aa246240f9e72f6a44d9a9019f3c51176a198b9e96a7f713219e77efed7f/ddxdb-0.4.6-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:e6908f2fcc1425978cc7b820843e78464b0b1618dceb7d2a600f891ddd498e9d", size = 6895207, upload-time = "2026-10-29T23:35:12.295Z" },
-    { url = "https://files.pythonhosted.org/packages/e9/26/5f2750e35668615a9b3926ca79ea13a30a517a3403e7f34cca2632230de2/ddxdb-0.4.6-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:f38de6731e1c6e4e7d7f6be7b9721f20a1c941212b03dea91a7ead1b8e6ad139", size = 6764705, upload-time = "2026-10-29T23:35:14.33Z" },
-    { url = "https://files.pythonhosted.org/packages/1e/be/52d71d0fa6aea897181341bf7b33ffb31d522774bdd2d8d84d5304aacb8a/ddxdb-0.4.6-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:f5f3ad2644dc7574298f2d307668531268c6351cb86459eeb394e2388c22ad56", size = 6882791, upload-time = "2026-10-29T23:35:17.265Z" },
-    { url = "https://files.pythonhosted.org/packages/17/45/e22c0370d4373eb526d9b888f7f0ce5ea0873a11e3042b29d3d8922367b2/ddxdb-0.4.6-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:38e4200f00ed6f82651f44cca9968345a6230629d56807130045c8d7e826b538", size = 7380912, upload-time = "2026-10-29T23:35:18.991Z" },
-    { url = "https://files.pythonhosted.org/packages/21/b0/f853b0b96d7e0cd46f8f23d7760b0fe8adbb9390a665d882ba0519c4c4a7/ddxdb-0.4.6-cp310-abi3-win_amd64.whl", hash = "sha256:14434c91e522edc85f82c8f46c15a557cd146fe91b75eb26a223726385870ea5", size = 7310842, upload-time = "2026-10-29T23:35:20.817Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/4a/4a55a1b5c49f873cc9ed0b0177d74ccd1b9c6c29538898db9a9583f459b3/ddxdb-0.4.7-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:e4c2138f330bbdcee24a40d085cb1970810632e7274e1df80c1d74f301b8c519", size = 6976159, upload-time = "2026-11-07T00:43:49.811Z" },
+    { url = "https://files.pythonhosted.org/packages/21/22/9bb705a7dab3412e295bba8ae3cd5b28d2622a5afe6711943233bd3126ed/ddxdb-0.4.7-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:87cebc24d855fa4265025574c3c3584be527f605f584c1f13e7fb88a1fbb30b8", size = 6837213, upload-time = "2026-11-07T00:43:51.862Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/46/b083d24f19d7ecde0f48d4eb77b3e4bb8b42e06112376e33ba89e9e8b285/ddxdb-0.4.7-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:b7bd0185bdc800a423015e01d27a04e5de9cb91b95d819f0437a29e034a348d6", size = 6949827, upload-time = "2026-11-07T00:43:53.866Z" },
+    { url = "https://files.pythonhosted.org/packages/93/be/7e472becbfe12de7ddb35352794d22abc48edfa877a70e8e53a9428cf087/ddxdb-0.4.7-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:e47f77194731d5834a998973c2abc6853e457c8fdb4ff3bec9b3b72ef165b536", size = 7463334, upload-time = "2026-11-07T00:43:55.75Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/11/09068fcb318e4ece5688d61a081f06a41efa7f0c1d57be477fca49fe2c00/ddxdb-0.4.7-cp310-abi3-win_amd64.whl", hash = "sha256:008a8950a732d8c14d601f6eaec3dfd233ad2c15d3ce7d0f01dc44cf512702cd", size = 7389928, upload-time = "2026-11-07T00:43:57.578Z" },
 ]
 
 [package.optional-dependencies]
@@ -591,9 +591,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ddxdb", specifier = ">=0.4.6,<0.5" },
-    { name = "ddxdb", extras = ["datafusion"], marker = "extra == 'datafusion'", specifier = ">=0.4.6,<0.5" },
-    { name = "ddxdb", extras = ["duckdb"], marker = "extra == 'duckdb'", specifier = ">=0.4.6,<0.5" },
+    { name = "ddxdb", specifier = ">=0.4.7,<0.5" },
+    { name = "ddxdb", extras = ["datafusion"], marker = "extra == 'datafusion'", specifier = ">=0.4.7,<0.5" },
+    { name = "ddxdb", extras = ["duckdb"], marker = "extra == 'duckdb'", specifier = ">=0.4.7,<0.5" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pyarrow", specifier = ">=21" },
     { name = "torch", specifier = ">=2.15", index = "https://download.pytorch.org/whl/cpu" },

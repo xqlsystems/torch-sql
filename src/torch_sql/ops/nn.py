@@ -79,6 +79,7 @@ def native_layer_norm(ctx, x, normalized_shape, weight, bias, eps):
     does. The variance is a second pass over the centered values, not
     ``AVG(x²) - AVG(x)²``, which loses precision (§9.4)."""
     dims = set(range(x.rank - len(normalized_shape), x.rank))
+    ctx.env.marked_cuts.add(x)  # a norm reads its input three times (D15)
     mean = grouped(x, dims, "AVG")
     centered = elementwise(x.shape, F64, [x, mean], lambda v, m: v - m)
     var = grouped(centered, dims, "AVG", g.Col(0, "v") * g.Col(0, "v"))

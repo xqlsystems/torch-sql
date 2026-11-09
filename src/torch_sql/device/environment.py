@@ -18,6 +18,7 @@ raises PyTorch's own error for a call PyTorch would refuse. The lowering
 from __future__ import annotations
 
 import weakref
+from collections import ChainMap
 
 import pyarrow as pa
 import torch
@@ -83,6 +84,9 @@ class Environment:
         self._ranges: dict[int, g.Table] = {}
         self._points: dict[int, g.Table] = {}
         self._index_tables: dict = {}
+        #: Nodes to save as tables whenever a program reads them: the inputs
+        #: of norms (decision D15). See torch_sql.program.
+        self.marked_cuts: weakref.WeakSet[g.Node] = weakref.WeakSet()
         #: The storage of each tensor created or written since the last
         #: sync(), by id. Not the tensors: PyTorch can't swap a tensor that
         #: has a weak reference, as module.to() does.
@@ -204,12 +208,14 @@ class Environment:
 
     def materialize(self, node: g.Node) -> g.Table:
         """Run ``node``'s query and save its rows as a table."""
+        from .. import program
+
         node = self.saved(node)
         if isinstance(node, g.Table):
             return node
-        table = g.Table(node.shape, node.dtype)
-        self.engine.materialize(table.name, self.query(node, key=True))
-        self._drop_with(table)
+        # A view of the saved tables that keeps the cut points' tables
+        # without copying the rest.
+        table = program.materialize(self, node, ChainMap({}, self._saved))
         self._saved[node.id] = table
         return table
 
