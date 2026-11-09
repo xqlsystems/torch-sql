@@ -115,7 +115,6 @@ class Environment:
             # PyTorch keeps the object only when it swaps tensors.
             self._swap = torch.__future__.get_swap_module_params_on_conversion()
             torch.__future__.set_swap_module_params_on_conversion(True)
-            self._swap_tensors, torch.utils.swap_tensors = torch.utils.swap_tensors, _swap_tensors
         self._depth += 1
         return self
 
@@ -132,7 +131,6 @@ class Environment:
         if self._depth == 0:
             self._hook.remove()
             torch.__future__.set_swap_module_params_on_conversion(self._swap)
-            torch.utils.swap_tensors = self._swap_tensors
         return self._mode.__exit__(*exc)
 
     def _after_step(self, optimizer, args, kwargs):
@@ -483,27 +481,6 @@ class Environment:
         target._write(node)
 
 
-def _swap_tensors(t1, t2):
-    """``torch.utils.swap_tensors``, which swaps two tensors' contents,
-    attributes included. ``load_state_dict`` and ``module.to()`` swap a
-    parameter with an alias of it (``Parameter(p.detach())``), whose chain
-    of bases (§8.6) then leads back to itself. Each base in either chain
-    that was one of the two tensors is now the other."""
-    _original_swap_tensors(t1, t2)
-    seen = set()
-    for t in (t1, t2):
-        while isinstance(t, Tensor) and id(t) not in seen:
-            seen.add(id(t))
-            if t._source is t1:
-                t._source = t2
-            elif t._source is t2:
-                t._source = t1
-            t = t._source
-
-
-_original_swap_tensors = torch.utils.swap_tensors
-
-
 def _functional_of(func):
     """The overload of ``func`` without ``out=``: ``maximum.out`` is
     ``maximum.default``, ``add.out`` is ``add.Tensor``."""
@@ -557,15 +534,11 @@ def _untracked(target: Tensor) -> bool:
     then keeps the history, so the gradient is the old value's; torch-sql
     gives the tensor the write's node, which a stop-gradient cuts from it.
     Autograd records the write only if gradients are enabled and the target
-    is the tensor with the history, not a ``.detach()`` alias of it."""
+    is the tensor with the history, not a ``.detach()`` alias of it. An
+    alias's base counts if it had its history when the alias was taken."""
     if torch.is_grad_enabled() and target.grad_fn is not None:
         return False
-    t = target
-    while t is not None:
-        if t.grad_fn is not None:
-            return True
-        t = t._source
-    return False
+    return target.grad_fn is not None or target._lineage.history
 
 
 def _requires_grad(args, kwargs) -> bool:
