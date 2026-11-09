@@ -65,12 +65,10 @@ FUNCTIONAL = {
 
 
 def is_sql(device) -> bool:
-    """Whether ``device`` names torch-sql's device. Inside the environment,
-    ``meta`` does too: torch-sql tensors live on ``meta``, so code that
-    creates a tensor on another tensor's device names ``meta``."""
+    """Whether ``device`` names torch-sql's device."""
     if device is None:
         return False
-    return torch.device(device).type in ("sql", "meta")
+    return torch.device(device).type == "sql"
 
 
 class Environment:
@@ -109,7 +107,14 @@ class Environment:
         return self
 
     def __exit__(self, *exc):
-        _active.remove(self)
+        if not _active or _active[-1] is not self:
+            # Each environment's modes stack on PyTorch's, so they can only
+            # come off innermost first.
+            raise RuntimeError(
+                "an environment exited while an environment entered after it was still "
+                "active; exit environments innermost first"
+            )
+        _active.pop()
         self._depth -= 1
         if self._depth == 0:
             self._hook.remove()
@@ -339,7 +344,7 @@ class Environment:
             nodes = lowering(Context(func, out, self), node, *rest, **kw)
             return tree_flatten(_stopped(nodes) if stop else nodes)[0]
 
-        return args[0], relower
+        return args[0], _once_per_node(relower)
 
     def _wrap(self, func, out, nodes, aliasing=None):
         flat, spec = tree_flatten(out)
@@ -423,10 +428,13 @@ class Environment:
             raise NotImplementedError(
                 f"{func} writes through a view, which torch-sql doesn't support (design §8.6)"
             )
-        result = self.dispatch(functional, (), args, kwargs)
-        if not isinstance(result, Tensor) or result.shape != target.shape:
+        out = self._meta(functional, args, kwargs)
+        if not isinstance(out, torch.Tensor) or out.shape != target.shape:
             # PyTorch resizes out=; torch-sql's tensors keep their shape.
             raise NotImplementedError(f"{func} with an out= of another shape")
+        # PyTorch's checks of the call with out=, such as a cast it refuses.
+        self._meta(func, args, {**kwargs, "out": target})
+        result = self.dispatch(functional, (), args, kwargs)
         self._assign(target, result._node)
         return target
 
@@ -463,6 +471,20 @@ def _functional_of(func):
         if not schema.is_mutable and [a.name for a in schema.arguments] == params:
             return candidate
     return None
+
+
+def _once_per_node(relower):
+    """``relower``, run once for each base node: after a write, the results
+    of a view op with many of them (``unbind``, ``split``) share one
+    lowering instead of each lowering the op again."""
+    last = [None, None]
+
+    def relowered(node):
+        if last[0] is not node:
+            last[:] = [node, relower(node)]
+        return last[1]
+
+    return relowered
 
 
 def _result(relower, k):
@@ -662,11 +684,18 @@ class _FunctionMode(TorchFunctionMode):
 
     def _to(self, args, kwargs):
         source = args[0]
+        # _parse_to doesn't take copy=.
+        parse = {k: v for k, v in kwargs.items() if k != "copy"}
+        device, dtype, _, _ = torch._C._nn._parse_to(*args[1:], **parse)
+        if device is None or not is_sql(device):
+            return None  # for a torch-sql tensor, dispatch: a cast, or a read
         if isinstance(source, Tensor):
-            return None  # dispatch handles it: a cast, or a read to the CPU
-        device, dtype, _, _ = torch._C._nn._parse_to(*args[1:], **kwargs)
-        if device is None or torch.device(device).type != "sql":
-            return None
+            # Already on sql, where PyTorch's C++ code can't copy to: what's
+            # left is the cast, or the copy, which dispatch handles.
+            copy = kwargs.get("copy", False)
+            if dtype is None and not copy:
+                return source
+            return source.to(dtype=dtype or source.dtype, copy=copy)
         cpu = source if dtype is None else source.to(dtype)
         t = self.env.tensor(cpu.detach())
         return t.requires_grad_() if source.requires_grad else t
