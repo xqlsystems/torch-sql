@@ -32,6 +32,7 @@ against.
 from __future__ import annotations
 
 import copy
+import weakref
 
 import torch
 
@@ -62,7 +63,7 @@ class Lineage:
     cycle through autograd's C++ graph, which Python's garbage collector
     can't see and so never frees."""
 
-    __slots__ = ("storage", "derive", "base", "cached", "same_values")
+    __slots__ = ("storage", "derive", "base", "cached", "same_values", "history")
 
     def __init__(self, storage: Storage, derive=None, base: Lineage | None = None, node=None):
         self.storage, self.derive, self.base = storage, derive, base
@@ -71,6 +72,11 @@ class Lineage:
         self.same_values = base is None
         #: An alias's node, and the base's node it was derived from.
         self.cached = None if base is None else (node, base.node())
+        #: Whether a tensor on the chain of bases had a history (a
+        #: ``grad_fn``) when this alias was taken. Not the tensors
+        #: themselves, as above, nor weak references to them, which
+        #: PyTorch's ``swap_tensors`` refuses.
+        self.history = False
 
     def node(self) -> g.Node:
         if self.base is None:
@@ -117,6 +123,13 @@ class Tensor(torch.Tensor):
             requires_grad=requires_grad,
         )
         t._env = env
+        #: The table holding the value of a tensor that keeps its graph
+        #: (see Environment.sync).
+        t._table = None
+        #: The node last returned as ``_node``, and the earlier ones still
+        #: alive, by id: a leaf's uses may have read any of them, and
+        #: backward() differentiates with respect to each.
+        t._last, t._earlier = None, weakref.WeakValueDictionary()
         if alias_of is None:
             t._lineage = Lineage(Storage(node))
             env._pending[id(t._storage)] = t._storage
@@ -124,6 +137,13 @@ class Tensor(torch.Tensor):
             base = alias_of._lineage
             t._lineage = Lineage(base.storage, derive, base, node)
             t._lineage.same_values = same_values and base.same_values
+            # Only an alias with the owner's values can be written (§8.6).
+            # A view never reads its base's grad_fn: autograd makes views
+            # again while it rebuilds a view's grad_fn after a write, and
+            # reading one then breaks the rebuild.
+            t._lineage.history = t._lineage.same_values and (
+                alias_of.grad_fn is not None or base.history
+            )
         return t
 
     @property
@@ -133,7 +153,15 @@ class Tensor(torch.Tensor):
     @property
     def _node(self) -> g.Node:
         """The node holding this tensor's current value."""
-        return self._lineage.node()
+        node = self._lineage.node()
+        if node is not self._last:
+            if self._last is not None:
+                self._earlier[self._last.id] = self._last
+                # Derived again after a write: the table, if any, holds the
+                # old value.
+                self._table = None
+            self._last = node
+        return node
 
     @_node.setter
     def _node(self, node: g.Node):
@@ -153,6 +181,7 @@ class Tensor(torch.Tensor):
                 "(design §8.6)"
             )
         self._storage.node = node
+        self._table = None
         self._storage.table = None
         self._env._pending[id(self._storage)] = self._storage
 
@@ -209,6 +238,13 @@ class Tensor(torch.Tensor):
     def __repr__(self, *, tensor_contents=None):
         body = repr(self.detach().cpu())
         return f"{body[:-1]}, device='sql')" if body.endswith(")") else body
+
+    def backward(self, gradient=None, retain_graph=None, create_graph=False, inputs=None):
+        """ddx computes the gradients, not PyTorch's autograd (§11.1); see
+        :func:`torch_sql.gradients.backward`."""
+        from ..gradients import backward
+
+        backward(self, gradient, retain_graph, create_graph, inputs)
 
     def __deepcopy__(self, memo):
         """A tensor with storage of its own, in the same environment, as a

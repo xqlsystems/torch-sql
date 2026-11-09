@@ -18,7 +18,20 @@ def same(ctx, x, *args, **kwargs):
     return x
 
 
-op(aten.alias.default, aten.detach.default, aten.lift_fresh.default, aten.clone.default)(same)
+op(aten.alias.default, aten.lift_fresh.default)(same)
+
+
+@op(aten.clone.default)
+def clone(ctx, x, *, memory_format=None):
+    """A node of its own: a clone is a separate tensor, and as a leaf it
+    gets a gradient of its own."""
+    return g.identity(x)
+
+
+@op(aten.detach.default)
+def detach(ctx, x):
+    """No gradient flows through a detached tensor (§11.3)."""
+    return g.identity(x, stop_gradient=True)
 
 
 def reindex(ctx, x: g.Node, index) -> g.Select:

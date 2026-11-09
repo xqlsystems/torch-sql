@@ -6,7 +6,10 @@ the writer picks a spelling both read alike:
 
 - a float literal is written with an exponent (``0.5e0``), which both read
   as DOUBLE; DuckDB reads ``0.5`` as a DECIMAL;
-- infinities and NaN are casts from strings;
+- infinities and NaN are read from a one-row table every engine registers,
+  :data:`IEEE`, since ddx refuses to differentiate a query that holds a
+  non-finite literal (xqlsystems/ddx#261). Outside a ``SELECT`` that a
+  gradient could reach (in ``VALUES``), they're casts from strings;
 - ``/`` only ever divides floats, since the engines divide integers
   differently.
 
@@ -74,6 +77,20 @@ FUNCTIONS = {
 
 AGGREGATES = {"SUM", "AVG", "MAX", "MIN", "COUNT"}
 
+#: The one-row table of non-finite values, and its columns.
+IEEE = PREFIX + "ieee"
+IEEE_COLUMNS = {"nan": math.nan, "pinf": math.inf, "ninf": -math.inf}
+
+
+def _nonfinite_column(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    return "pinf" if value > 0 else "ninf"
+
+
+def _nonfinite(e: Expr) -> bool:
+    return isinstance(e, Lit) and isinstance(e.value, float) and not math.isfinite(e.value)
+
 
 def cte_name(node: Node) -> str:
     return f"{PREFIX}n{node.id}"
@@ -98,23 +115,31 @@ def literal(value, dtype: torch.dtype) -> str:
     return s if "e" in s else f"{s}e0"
 
 
-def expr(e: Expr, aliases: list[str]) -> str:
-    """``e`` in SQL, reading input ``k`` under the alias ``aliases[k]``."""
+def expr(e: Expr, aliases: list[str], ieee: str | None = None, grouped: bool = False) -> str:
+    """``e`` in SQL, reading input ``k`` under the alias ``aliases[k]``, and
+    a non-finite constant from :data:`IEEE` under the alias ``ieee``. In a
+    grouping ``SELECT`` (``grouped``), a constant read outside an aggregate
+    is read through an aggregate, which every row's group allows: ``MIN``
+    for ``-inf``, since DataFusion 55's grouped ``MAX`` of ``-inf`` is
+    ``f64::MIN``, and ``MAX`` otherwise."""
     if isinstance(e, Col):
         return f"{aliases[e.input]}.{e.name}"
     if isinstance(e, Lit):
+        if ieee is not None and _nonfinite(e):
+            col = f"{ieee}.{_nonfinite_column(e.value)}"
+            if not grouped:
+                return col
+            return f"MIN({col})" if e.value == -math.inf else f"MAX({col})"
         return literal(e.value, e.dtype)
     if isinstance(e, Agg):
         if e.fn not in AGGREGATES:
             raise ValueError(f"unknown aggregate {e.fn}")
-        return f"{e.fn}({expr(e.arg, aliases)})"
+        return f"{e.fn}({expr(e.arg, aliases, ieee, False)})"
     if isinstance(e, Call):
-        args = [expr(a, aliases) for a in e.args]
+        args = [expr(a, aliases, ieee, grouped) for a in e.args]
         if e.fn in BINARY:
             a, b = args
             return f"({a} {BINARY[e.fn]} {b})"
-        if e.fn == "neg":
-            return f"(-{args[0]})"
         if e.fn == "not":
             return f"(NOT {args[0]})"
         if e.fn == "case":  # case(cond, then, else)
@@ -135,6 +160,8 @@ def cast_to(e: Expr, dtype: torch.dtype) -> Call:
 
 def select(node: Select, resolve=lambda n: n) -> str:
     aliases = [f"t{k}" for k in range(len(node.inputs))]
+    nonfinite = any(_nonfinite(sub) for e in node.expressions() for sub in walk(e))
+    ieee = "tieee" if nonfinite else None
     # Attach each equality to the latest input it reads, so that every input
     # joins on the ones before it; an input no equality reaches is a cross
     # join.
@@ -143,7 +170,7 @@ def select(node: Select, resolve=lambda n: n) -> str:
         reads = [c.input for e in (a, b) for c in _cols(e)]
         if not reads:
             raise ValueError("a join condition must read a column")
-        conditions[max(reads)].append(f"{expr(a, aliases)} = {expr(b, aliases)}")
+        conditions[max(reads)].append(f"{expr(a, aliases, ieee)} = {expr(b, aliases, ieee)}")
     if node.inputs and conditions[0]:
         raise ValueError("a join condition reads only the first input; write it as a filter")
     parts = [f"{relation(resolve(node.inputs[0]))} {aliases[0]}"] if node.inputs else []
@@ -153,13 +180,19 @@ def select(node: Select, resolve=lambda n: n) -> str:
             parts.append(f"JOIN {source} ON {' AND '.join(conditions[k])}")
         else:
             parts.append(f"CROSS JOIN {source}")
-    cols = [f"{expr(e, aliases)} AS {c}" for e, c in zip(node.index, node.columns, strict=True)]
-    cols.append(f"{expr(node.value, aliases)} AS v")
+    if ieee is not None:
+        parts.append(f"CROSS JOIN {IEEE} {ieee}" if parts else f"{IEEE} {ieee}")
+    grouped = node.group
+    cols = [
+        f"{expr(e, aliases, ieee, grouped)} AS {c}"
+        for e, c in zip(node.index, node.columns, strict=True)
+    ]
+    cols.append(f"{expr(node.value, aliases, ieee, grouped)} AS v")
     sql = f"SELECT {', '.join(cols)}"
     if parts:
         sql += f" FROM {' '.join(parts)}"
     if node.where is not None:
-        sql += f" WHERE {expr(node.where, aliases)}"
+        sql += f" WHERE {expr(node.where, aliases, ieee)}"
     # A constant index (a dimension keepdim keeps) isn't grouped by: an
     # integer literal in GROUP BY means a column position.
     keys = [expr(e, aliases) for e in node.index if _cols(e)]

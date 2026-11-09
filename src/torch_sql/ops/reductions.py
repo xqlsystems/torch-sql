@@ -7,7 +7,7 @@ PyTorch's ``amax`` and ``amin`` return NaN for a group holding one. SQL's
 don't, reliably: DataFusion's ``MAX`` returns NaN without a ``GROUP BY`` and
 skips it with one, and ``MIN`` skips it on both engines, since SQL orders
 NaN above every number. So a float ``amax`` checks for NaN itself, and
-``amin`` is ``-amax(-x)``.
+``amin`` of floats is ``-amax(-x)``.
 
 DataFusion 55's grouped ``MAX`` also gives ``f64::MIN`` (-1.797e308) for a
 group whose values are all ``-inf``, where PyTorch gives ``-inf``, so a
@@ -82,12 +82,23 @@ def amax(ctx, x, dim=(), keepdim=False):
 
 @op(aten.amin.default, aten.min.default)
 def amin(ctx, x, dim=(), keepdim=False):
+    if x.dtype != torch.float64:
+        return reduce(ctx, x, dim, keepdim, "MIN")
+    minus = g.Lit(-1.0, torch.float64)
     negated = g.Select(
-        x.shape, x.dtype, (x,), index=tuple(g.Col(0, c) for c in x.columns), value=-g.Col(0, "v")
+        x.shape,
+        x.dtype,
+        (x,),
+        index=tuple(g.Col(0, c) for c in x.columns),
+        value=minus * g.Col(0, "v"),
     )
     m = reduce(ctx, negated, dim, keepdim, "MAX")
     return g.Select(
-        m.shape, m.dtype, (m,), index=tuple(g.Col(0, c) for c in m.columns), value=-g.Col(0, "v")
+        m.shape,
+        m.dtype,
+        (m,),
+        index=tuple(g.Col(0, c) for c in m.columns),
+        value=minus * g.Col(0, "v"),
     )
 
 
