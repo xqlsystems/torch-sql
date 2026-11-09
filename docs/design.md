@@ -811,7 +811,9 @@ new one; the old value stays available to anything that already read it.
 This is how torchax handles in-place ops too. An op with `out=`
 (`torch.maximum(a, b, out=a)`, which `Adam(amsgrad=True)` calls) is the
 same: the op without `out=`, whose result replaces `out`'s node. PyTorch
-resizes an `out=` of another shape; torch-sql refuses it.
+resizes an `out=` of another shape; torch-sql refuses it. PyTorch's own
+checks of the `out=` call run first, so a cast it refuses (a `float64`
+result into an `int64` `out=`) raises, as in PyTorch.
 
 A view (`x[:2]`, `x.view(2, 2)`, `x.t()`) and `x.detach()` share their
 base's storage in PyTorch, so they must see an in-place op on it. In
@@ -868,9 +870,12 @@ process, in C++, because PyTorch finds no device guard for it. PyTorch's
 `torch.utils.backend_registration._setup_privateuseone_for_python_backend`
 registers one from Python, and then autograd, checkpointing and
 `torch.compile` all work. It is experimental and private, against the spirit
-of P5. Allocating on `meta`, as torchax does, needs neither, at the cost of
-`p.device` not reading `"sql"`. torch-sql allocates on `meta`, as torchax
-does (D16).
+of P5. Allocating on `meta`, as torchax does, needs neither. torch-sql
+allocates on `meta`, as torchax does (D16). PyTorch's C++ code sees `meta`,
+but `torch_sql.Tensor` overrides the Python `device` property to read
+`"sql"`. So code that makes a tensor on another tensor's device
+(`torch.zeros(n, device=x.device)`, `t.to(x.device)`) makes a torch-sql
+tensor, and `device="meta"` keeps meaning PyTorch's meta device.
 - An `Environment` holds a `TorchFunctionMode`, a `TorchDispatchMode` and the
   op table. While it is active, every op on a `"sql"` tensor, and every op that
   creates one, goes through `Environment.dispatch`.
@@ -1528,8 +1533,8 @@ saves the input of every norm, and every other value read more than once, as
 a table between plans (§9.6).
 
 **D16. Allocate on `meta`, as torchax does (Alex, 2026-11-08).** A
-torch-sql tensor is a wrapper subclass on PyTorch's `meta` device, so
-`p.device` reads `meta`, not `sql` (§9.1). The alternative, PyTorch's
+torch-sql tensor is a wrapper subclass on PyTorch's `meta` device. Its
+Python `device` property reads `sql` (§9.1). The alternative, PyTorch's
 private Python-backend setup, is experimental (P5). torch-sql follows
 torchax's choice here, and will revisit it if torchax does.
 

@@ -87,8 +87,28 @@ def test_cut_points_bound_every_query():
     sizes, cut = {}, {c.id for c in cuts}
     for n in g.topological([node]):
         sizes[n.id] = 1 + sum(1 if i.id in cut else sizes[i.id] for i in n.inputs)
-        assert sizes[n.id] <= 8 or n.id in cut
+        assert sizes[n.id] <= 8  # each query, a cut point's own included
     assert program.cut_points(node, lambda n: n, None, set()) == []
+
+
+def test_cut_points_bound_a_query_with_many_inputs():
+    # A node that reads many inputs just under the budget: cutting the node
+    # after it's too big would leave a query of about fan-in × budget.
+    a = g.Values((), F64, rows=((1.0,),))
+    branches = []
+    for _ in range(4):
+        node = a
+        for _ in range(6):
+            node = g.Select((), F64, (node,), value=g.Col(0, "v") + g.Lit(1.0, F64))
+        branches.append(node)
+    root = g.Select((), F64, tuple(branches), value=g.Col(0, "v"))
+    cuts = program.cut_points(root, lambda n: n, 8, set())
+    sizes, cut = {}, {c.id for c in cuts}
+    order = {n.id: k for k, n in enumerate(g.topological([root]))}
+    assert [order[c.id] for c in cuts] == sorted(order[c.id] for c in cuts)
+    for n in g.topological([root]):
+        sizes[n.id] = 1 + sum(1 if i.id in cut else sizes[i.id] for i in n.inputs)
+        assert sizes[n.id] <= 8
 
 
 def test_norm_inputs_are_cut_on_datafusion():
