@@ -9,9 +9,11 @@ that no query it hands an engine grows past a budget.
 **Choosing them** (:func:`cut_points`). Walking the graph from its inputs,
 each node's *inlined size* is the number of ``SELECT`` blocks the engine
 would plan for it if every node it reads were written into it: one, plus
-the inlined size of each input, once per read. A table counts once. A node
-is a cut point when its inlined size passes the engine's budget, or when it
-feeds a norm, which reads its input three times (decision D15). Only
+the inlined size of each input, once per read. A table counts once. When a
+node's inlined size would pass the engine's budget, its largest inputs
+become cut points, until it fits, so no query passes the budget unless a
+node reads more tables than the budget allows. A node that feeds a norm,
+which reads its input three times, is a cut point too (decision D15). Only
 DataFusion has a budget; DuckDB plans a CTE read many times once, so it
 gets no cut points and every query stays whole.
 
@@ -51,17 +53,33 @@ def cut_points(root: g.Node, read, budget: int | None, marked) -> list[g.Node]:
     of norms)."""
     if budget is None:
         return []
-    size, cuts = {}, []
-    for node in g.topological([root], read):
+    size, order, cuts = {}, {}, {}
+    for k, node in enumerate(g.topological([root], read)):
+        order[node.id] = k
         if isinstance(node, g.Table):
             size[node.id] = 1
             continue
-        s = 1 + sum(size[read(i).id] for i in node.inputs)
-        if node is not root and (node in marked or s > budget):
-            cuts.append(node)
+        reads = defaultdict(int)  # an input's id -> how often the node reads it
+        inputs = {}
+        for i in node.inputs:
+            i = read(i)
+            reads[i.id] += 1
+            inputs[i.id] = i
+        s = 1 + sum(size[i] * n for i, n in reads.items())
+        # Cutting the inputs that save the most first, so the node's own
+        # query fits, rather than cutting the node after it's too big.
+        for i in sorted(reads, key=lambda i: size[i] * reads[i], reverse=True):
+            if s <= budget or size[i] == 1:
+                break
+            s -= (size[i] - 1) * reads[i]
+            size[i] = 1
+            cuts[i] = inputs[i]
+        if node is not root and node in marked:
+            cuts[node.id] = node
             s = 1
         size[node.id] = s
-    return cuts
+    # In the order they're computed, so each reads the ones before it.
+    return sorted(cuts.values(), key=lambda n: order[n.id])
 
 
 def materialize(env, root: g.Node, resolve: dict) -> g.Table:
