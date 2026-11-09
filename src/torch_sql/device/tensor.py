@@ -4,9 +4,10 @@ It's a *wrapper subclass*: a ``torch.Tensor`` subclass that holds no data of
 its own, so PyTorch sends every ATen op on it to its ``__torch_dispatch__``.
 torchax, a PyTorch backend that runs ops as JAX, makes the same kind of
 tensor, and as it does, torch-sql allocates them on PyTorch's ``meta``
-device, which tracks shapes and dtypes but holds no data. So ``t.device`` reads ``meta``, not
-``sql``; giving it a ``sql`` device would need PyTorch's private
-Python-backend setup (spike S1), which the design decides against (D16).
+device, which tracks shapes and dtypes but holds no data. A ``sql`` device
+underneath would need PyTorch's private Python-backend setup (spike S1),
+which the design decides against (D16). PyTorch's C++ code sees ``meta``;
+the Python ``device`` property reads ``sql``.
 
 A tensor holds a node of the recorded graph (:mod:`torch_sql.graph`) and the
 environment that records it. Ops make new tensors with new nodes; nothing
@@ -36,6 +37,10 @@ import weakref
 import torch
 
 from .. import graph as g
+
+#: The device a torch-sql tensor reports. Importing the device package names
+#: PyTorch's spare device slot ``sql``, before this module is used.
+_SQL = None
 
 
 class Storage:
@@ -171,6 +176,14 @@ class Tensor(torch.Tensor):
             raise RuntimeError("p.data = t needs t on the same torch-sql environment as p")
         torch.Tensor.data.__set__(self, value)
         self._adopt(value)
+
+    @property
+    def device(self):
+        """``sql``. PyTorch's C++ code sees ``meta``, where the tensor is
+        allocated; Python code that makes a tensor on another's device
+        (``torch.zeros(n, device=x.device)``, ``t.to(x.device)``) names
+        ``sql``, so ``meta`` keeps meaning PyTorch's own meta device."""
+        return _SQL
 
     @property
     def is_meta(self):

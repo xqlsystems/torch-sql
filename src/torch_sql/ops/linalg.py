@@ -54,6 +54,15 @@ def bmm(ctx, a, b):
 def addmm(ctx, bias, a, b, *, beta=1, alpha=1):
     out = ctx.out
     product = mm(ctx, a, b)
+    if beta == 0:
+        # PyTorch ignores the bias, so a NaN or an infinity in it doesn't
+        # reach the result.
+        return elementwise(
+            out.shape,
+            out.dtype,
+            [product],
+            lambda p: p if alpha == 1 else p * scalar(alpha, out.dtype),
+        )
 
     def fn(c, p):
         c = c if beta == 1 else c * scalar(beta, out.dtype)

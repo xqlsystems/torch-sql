@@ -40,12 +40,33 @@ def test_factories_match_the_cpu(env):
 def test_to_sql_and_back(env):
     x = torch.randn(3, dtype=F64)
     y = x.to("sql")
-    assert isinstance(y, torch_sql.Tensor) and y.device.type == "meta"
+    assert isinstance(y, torch_sql.Tensor) and y.device.type == "sql"
     out = y.cpu()
     assert type(out) is torch.Tensor and torch.equal(out, x)
     assert torch.equal(y.to("cpu"), x)
     assert y.tolist() == x.tolist()
     assert (y.numpy() == x.numpy()).all()
+
+
+def test_device_of_a_tensor(env):
+    # A tensor reports sql, so a tensor made on its device is torch-sql's,
+    # and meta keeps meaning PyTorch's meta device.
+    x = torch.ones(2, dtype=F64, device="sql")
+    assert isinstance(torch.ones(2, dtype=F64).to(x.device), torch_sql.Tensor)
+    assert isinstance(torch.zeros(2, dtype=F64, device=x.device), torch_sql.Tensor)
+    assert x.to(x.device) is x
+    assert x.to("sql", torch.int64).dtype == torch.int64
+    y = x.to("sql", copy=True)
+    assert y is not x and torch.equal(y.cpu(), x.cpu())
+    meta = torch.empty(2, device="meta")
+    assert type(meta) is torch.Tensor and meta.is_meta
+
+
+def test_to_with_copy(env):
+    x = torch.ones(2, dtype=F64)
+    assert torch.equal(x.to("cpu", copy=True), x)
+    y = x.to("sql", copy=True)
+    assert isinstance(y, torch_sql.Tensor) and torch.equal(y.cpu(), x)
 
 
 def test_device_parses():
@@ -522,3 +543,58 @@ def test_out_of_another_shape_or_through_a_view_is_refused(env):
         torch.add(a, a, out=torch.zeros(2, 3, dtype=F64, device="sql"))
     with pytest.raises(NotImplementedError, match="through a view"):
         torch.add(a[:2], a[:2], out=a[1:])
+
+
+def test_out_of_a_dtype_pytorch_refuses(env):
+    a = torch.full((2,), 2.5, dtype=F64, device="sql")
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.add(a, a, out=torch.zeros(2, dtype=torch.int64, device="sql"))
+    # A cast PyTorch allows still happens.
+    i = torch.tensor([1, 2], device="sql")
+    c = torch.zeros(2, dtype=F64, device="sql")
+    torch.add(i, i, out=c)
+    same(c, torch.tensor([2.0, 4.0], dtype=F64))
+
+
+def test_environments_exit_innermost_first(engine):
+    e1, e2 = torch_sql.Environment(engine), torch_sql.Environment(engine)
+    e1.enable()
+    e2.enable()
+    try:
+        with pytest.raises(RuntimeError, match="innermost first"):
+            e1.disable()
+        assert torch_sql.Environment.active() is e2
+    finally:
+        e2.disable()
+        e1.disable()
+    assert torch_sql.Environment.active() is None
+
+
+def test_unbind_after_a_write_lowers_once(env, monkeypatch):
+    from torch_sql.ops import shape
+
+    x = torch.arange(12, dtype=F64).reshape(4, 3).to("sql")
+    rows = x.unbind()
+    x.mul_(2)
+    calls = []
+    select = shape.select
+    monkeypatch.setattr(shape, "select", lambda *a: calls.append(1) or select(*a))
+    for k, row in enumerate(rows):
+        same(row, torch.arange(12, dtype=F64).reshape(4, 3)[k] * 2)
+    assert len(calls) == 4
+
+
+def test_integer_pow_is_refused(env):
+    i = torch.tensor([3], device="sql")
+    with pytest.raises(NotImplementedError, match="pow of torch.int64"):
+        torch.pow(i, i)
+    with pytest.raises(NotImplementedError, match="pow of torch.int64"):
+        torch.pow(3, i)
+    same(torch.pow(i.double(), 39), torch.tensor([3.0**39], dtype=F64))
+
+
+def test_addmm_with_beta_zero_ignores_the_bias(env):
+    bias = torch.tensor([float("nan"), float("inf")], dtype=F64, device="sql")
+    a = torch.eye(2, dtype=F64, device="sql")
+    same(torch.addmm(bias, a, a, beta=0), torch.eye(2, dtype=F64))
+    same(torch.addmm(bias, a, a, beta=0, alpha=3), 3 * torch.eye(2, dtype=F64))
