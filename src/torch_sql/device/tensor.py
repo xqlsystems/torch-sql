@@ -137,7 +137,13 @@ class Tensor(torch.Tensor):
             base = alias_of._lineage
             t._lineage = Lineage(base.storage, derive, base, node)
             t._lineage.same_values = same_values and base.same_values
-            t._lineage.history = alias_of.grad_fn is not None or base.history
+            # Only an alias with the owner's values can be written (§8.6).
+            # A view never reads its base's grad_fn: autograd makes views
+            # again while it rebuilds a view's grad_fn after a write, and
+            # reading one then breaks the rebuild.
+            t._lineage.history = t._lineage.same_values and (
+                alias_of.grad_fn is not None or base.history
+            )
         return t
 
     @property
