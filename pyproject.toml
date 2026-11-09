@@ -48,7 +48,8 @@ addopts = "-ra"
 
 [tool.ruff]
 line-length = 100
-extend-exclude = ["docs/spikes"]
+# nanoGPT's model.py is a copy kept unchanged.
+extend-exclude = ["docs/spikes", "tests/nanogpt"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

@@ -37,7 +37,9 @@ repositories' `flake.nix` files do.
 
 ## Example
 
-A two-layer MLP on `device="sql"`, run on DuckDB:
+nanoGPT's `model.py`, unchanged but for its GELU, trains on `device="sql"`
+and matches PyTorch step by step (`tests/test_nanogpt.py`). A smaller
+example, a two-layer MLP run on DuckDB:
 
 ```python
 import torch, torch_sql

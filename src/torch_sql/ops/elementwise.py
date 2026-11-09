@@ -328,6 +328,12 @@ def where(ctx, cond, a, b):
     return elementwise(shape, dtype, [cond, a, b], case, compute=[torch.bool, dtype, dtype])
 
 
+@op(aten.masked_fill.Scalar, aten.masked_fill.Tensor)
+def masked_fill(ctx, x, mask, value):
+    shape, dtype = out_of(ctx)
+    return elementwise(shape, dtype, [mask, value, x], case, compute=[torch.bool, dtype, dtype])
+
+
 def _extremum(cmp):
     # A NaN in either argument wins, as in PyTorch.
     def lower(ctx, a, b):

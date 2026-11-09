@@ -23,6 +23,7 @@ import pyarrow as pa
 import torch
 from torch.optim.optimizer import register_optimizer_step_post_hook
 from torch.overrides import TorchFunctionMode
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .. import graph as g
@@ -31,6 +32,7 @@ from ..boundary.layout import to_dense, to_table
 from ..engines import Engine
 from ..engines import engine as make_engine
 from ..ops import LOWERINGS, Context, OperatorNotFound
+from .functions import FUNCTIONS
 from .tensor import Storage, Tensor
 
 aten = torch.ops.aten
@@ -103,6 +105,12 @@ class Environment:
         _active.append(self)
         if self._depth == 0:
             self._hook = register_optimizer_step_post_hook(self._after_step)
+            # module.to("sql") must keep each Parameter object, as it does
+            # for CUDA: nanoGPT ties lm_head.weight to wte.weight, and a new
+            # Parameter per module would untie them. For a tensor subclass,
+            # PyTorch keeps the object only when it swaps tensors.
+            self._swap = torch.__future__.get_swap_module_params_on_conversion()
+            torch.__future__.set_swap_module_params_on_conversion(True)
         self._depth += 1
         return self
 
@@ -118,6 +126,7 @@ class Environment:
         self._depth -= 1
         if self._depth == 0:
             self._hook.remove()
+            torch.__future__.set_swap_module_params_on_conversion(self._swap)
         return self._mode.__exit__(*exc)
 
     def _after_step(self, optimizer, args, kwargs):
@@ -255,8 +264,11 @@ class Environment:
         if lowering is None:
             decomposition = DECOMPOSITIONS.get(func)
             if decomposition is not None:
-                # It calls simpler ops, which come back here.
-                return decomposition(*args, **kwargs)
+                # It calls simpler ops, which come back here. Some create
+                # tensors on the input's device, sql to Python code and meta
+                # to C++; _Factories makes those torch-sql tensors.
+                with _Factories(self):
+                    return decomposition(*args, **kwargs)
             raise OperatorNotFound(
                 f"torch-sql has no lowering for {func}, and PyTorch has no decomposition of it"
             )
@@ -318,8 +330,11 @@ class Environment:
                     return x.item()
                 if x.device.type == "meta":
                     raise RuntimeError(
-                        "a plain meta tensor reached torch-sql; create tensors with "
-                        "device='sql' while the environment is active"
+                        "a plain meta tensor reached torch-sql. Create tensors with "
+                        "device='sql' while the environment is active. If this came from "
+                        "inside a PyTorch function, PyTorch decomposed it in C++ into ops that "
+                        "create tensors, and torch-sql needs to lower that function "
+                        "(torch_sql.device.functions)"
                     )
                 raise RuntimeError(f"expected torch-sql tensors, got one on {x.device}")
             return x
@@ -616,6 +631,17 @@ def _to_copy(env: Environment, x, **kwargs):
     )
 
 
+def _to_device(
+    env: Environment, x, device, dtype=None, non_blocking=False, copy=False, memory_format=None
+):
+    """``aten.to.device``, which decompositions call: a read to the CPU, or a
+    cast."""
+    kwargs = {"device": device} if device is not None else {}
+    if dtype is not None:
+        kwargs["dtype"] = dtype
+    return _to_copy(env, x, **kwargs)
+
+
 def _copy_(env: Environment, dst, src, non_blocking=False):
     if not isinstance(dst, Tensor):
         raise RuntimeError("copying a torch-sql tensor into a CPU tensor: use .cpu()")
@@ -633,6 +659,15 @@ def _copy_(env: Environment, dst, src, non_blocking=False):
     return dst
 
 
+def _bernoulli_(env: Environment, x, p=0.5, *, generator=None):
+    """In place, with ``p``'s default, which the functional form lacks."""
+    if x._is_view():
+        raise NotImplementedError("bernoulli_ writes through a view (design §8.6)")
+    cpu = torch.empty(tuple(x.shape), dtype=x.dtype).bernoulli_(p, generator=generator)
+    env._assign(x, env.upload(cpu))
+    return x
+
+
 def _scalar(env: Environment, x):
     return env.read(x).item()
 
@@ -643,10 +678,35 @@ def _is_nonzero(env: Environment, x):
 
 _SPECIAL = {
     aten._to_copy.default: _to_copy,
+    aten.to.device: _to_device,
+    aten.bernoulli_.float: _bernoulli_,
     aten.copy_.default: _copy_,
     aten._local_scalar_dense.default: _scalar,
     aten.is_nonzero.default: _is_nonzero,
 }
+
+
+class _Factories(TorchDispatchMode):
+    """While a decomposition runs: an op that creates a tensor on ``sql``
+    or ``meta`` from no tensor (``scalar_tensor``, ``full``, ``arange``), as
+    decompositions do for the device of their inputs, runs on the CPU and
+    becomes a torch-sql tensor. Every other op passes through."""
+
+    def __init__(self, env: Environment):
+        super().__init__()
+        self.env = env
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        device = kwargs.get("device")
+        if (
+            device is not None
+            and torch.device(device).type in ("sql", "meta")
+            and not any(isinstance(a, torch.Tensor) for a in torch.utils._pytree.tree_leaves(args))
+        ):
+            cpu = func(*args, **{**kwargs, "device": torch.device("cpu")})
+            return self.env.tensor(cpu)
+        return func(*args, **kwargs)
 
 
 # -- The function mode ----------------------------------------------------
@@ -662,6 +722,9 @@ class _FunctionMode(TorchFunctionMode):
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+        replacement = FUNCTIONS.get(func)
+        if replacement is not None and _has_sql(args, kwargs):
+            return replacement(*args, **kwargs)
         if func is torch.Tensor.to:
             moved = self._to(args, kwargs)
             if moved is not None:
