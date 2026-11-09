@@ -513,15 +513,11 @@ def _untracked(target: Tensor) -> bool:
     then keeps the history, so the gradient is the old value's; torch-sql
     gives the tensor the write's node, which a stop-gradient cuts from it.
     Autograd records the write only if gradients are enabled and the target
-    is the tensor with the history, not a ``.detach()`` alias of it."""
+    is the tensor with the history, not a ``.detach()`` alias of it. An
+    alias's base counts if it had its history when the alias was taken."""
     if torch.is_grad_enabled() and target.grad_fn is not None:
         return False
-    t = target
-    while t is not None:
-        if t.grad_fn is not None:
-            return True
-        t = t._source
-    return False
+    return target.grad_fn is not None or target._lineage.history
 
 
 def _requires_grad(args, kwargs) -> bool:

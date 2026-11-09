@@ -818,11 +818,14 @@ result into an `int64` `out=`) raises, as in PyTorch.
 A view (`x[:2]`, `x.view(2, 2)`, `x.t()`) and `x.detach()` share their
 base's storage in PyTorch, so they must see an in-place op on it. In
 torch-sql they share a *storage* object, which holds the owner's current
-node. Each alias keeps the tensor it was taken from and the function that
-derives its node from that tensor's. After a write, each alias derives its
-node again, from its base's current node, so a chain of aliases (a view of
-an `nn.Parameter`, itself an alias of the tensor it wraps) shares one node
-per value. DataFusion Accelerated, the planned DataFusion extension that
+node. Each alias keeps the function that derives its node from the node of
+the tensor it was taken from (its base), and how that tensor finds its own
+node, but not the tensor itself. PyTorch's autograd saves a `.detach()` of
+an op's output, so an alias holding the output would make a reference cycle
+through autograd's C++ graph, which Python never frees. After a write, each
+alias derives its node again, from its base's current node, so a chain of
+aliases (a view of an `nn.Parameter`, itself an alias of the tensor it
+wraps) shares one node per value. DataFusion Accelerated, the planned DataFusion extension that
 runs plans on accelerators (open question 8), has table handles that work
 the same way: a query reads a handle's current buffer, not the one it was
 planned against (its design, §5.2). `p.data = t` makes `p` share `t`'s
