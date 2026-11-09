@@ -557,3 +557,15 @@ def test_scalar_losses_with_scalar_operands(env, other):
     expected = o.detach().cpu().item()
     (s * o).backward()
     torch.testing.assert_close(s.grad.cpu().item(), expected)
+
+
+def test_view_of_a_leaf_written_without_grad(env):
+    # Autograd rebuilds the view's grad_fn after the write, making the view
+    # again through torch-sql.
+    x = torch.zeros(2, 3, dtype=F64).to("sql").requires_grad_()
+    v = x[1]
+    with torch.no_grad():
+        x.add_(0.5)
+    assert v.detach().cpu().tolist() == [0.5, 0.5, 0.5]
+    (v * 2).sum().backward()
+    assert x.grad.cpu().tolist() == [[0.0] * 3, [2.0] * 3]
