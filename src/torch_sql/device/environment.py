@@ -275,6 +275,15 @@ class Environment:
                 # to C++; _Factories makes those torch-sql tensors.
                 with _Factories(self):
                     return decomposition(*args, **kwargs)
+            if torch._C._dispatch_has_kernel_for_dispatch_key(
+                func.name(), "CompositeImplicitAutograd"
+            ):
+                # An op PyTorch writes in C++ as simpler ops, such as
+                # flatten, which PyTorch's Python decompositions call
+                # (issue #27). Above the dispatcher, PyTorch runs this
+                # itself; inside a decomposition, torch-sql must.
+                with _Factories(self):
+                    return func.decompose(*args, **kwargs)
             raise OperatorNotFound(
                 f"torch-sql has no lowering for {func}, and PyTorch has no decomposition of it"
             )

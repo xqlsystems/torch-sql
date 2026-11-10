@@ -623,3 +623,25 @@ def test_in_place_foreach_of_a_dtype_pytorch_refuses(env):
     with pytest.raises(RuntimeError, match="can't be cast"):
         torch._foreach_maximum_(a, b)
     same(a[0], torch.tensor([1, 2]))
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (1, 1), (2,)])
+def test_norm_of_one_element(env, shape):
+    # PyTorch's decomposition of vector_norm flattens a tensor of one
+    # element, calling aten.flatten.using_ints, which only C++ decomposes.
+    x = torch.full(shape, -3.0, dtype=F64)
+    same(torch.linalg.vector_norm(x.to("sql")), torch.linalg.vector_norm(x))
+    same(x.to("sql").norm(), x.norm())
+
+
+def test_clip_grad_norm_of_a_one_element_bias(env):
+    torch.manual_seed(0)
+    model = torch.nn.Linear(2, 1).double()
+    device = torch.nn.Linear(2, 1).double().to("sql")
+    device.load_state_dict(model.state_dict())
+    x = torch.randn(4, 2, dtype=F64)
+    for m, inputs in ((model, x), (device, x.to("sql"))):
+        m(inputs).pow(2).mean().backward()
+        torch.nn.utils.clip_grad_norm_(m.parameters(), 0.5)
+    for p, q in zip(model.parameters(), device.parameters(), strict=True):
+        torch.testing.assert_close(q.grad.cpu(), p.grad)
