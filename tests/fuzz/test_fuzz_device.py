@@ -294,15 +294,14 @@ def test_gradient_of_a_sum_of_an_expand(engine):
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="#20: max(dim)'s gradient at a tie is split, as amax's")
 @pytest.mark.parametrize("engine", ENGINES)
 @pytest.mark.parametrize("fn", ["max", "min"])
 def test_gradient_of_max_along_a_dim_at_a_tie(engine, fn):
     """``x.max(dim)`` returns values and indices, and PyTorch's gradient of
     the values goes to the returned index only. ``amax`` splits it among
-    the tied elements, and torch-sql lowers ``max.dim``'s values as
-    ``amax``, so a row ``[1, 3, 3]`` gets ``[0, 0.5, 0.5]`` where PyTorch
-    gives ``[0, 1, 0]``."""
+    the tied elements, and when torch-sql lowered ``max.dim``'s values as
+    ``amax``, a row ``[1, 3, 3]`` got ``[0, 0.5, 0.5]`` where PyTorch gives
+    ``[0, 1, 0]`` (issue #20)."""
     import torch_sql
 
     def program(device):
@@ -319,25 +318,15 @@ def test_gradient_of_max_along_a_dim_at_a_tie(engine, fn):
 
 
 @pytest.mark.pinned
-@pytest.mark.parametrize(
-    "engine",
-    [
-        pytest.param(
-            "datafusion",
-            marks=pytest.mark.xfail(
-                strict=True, reason="#22: ddx can't differentiate a RightSemi join"
-            ),
-        ),
-        "duckdb",
-    ],
-)
+@pytest.mark.parametrize("engine", ENGINES)
 @pytest.mark.parametrize("how", ["argmax", "max_indices"])
 def test_gradient_through_a_gather_by_argmax(engine, how):
     """``argmax`` joins ``x`` with its maximum and reads only ``x``'s
     columns, and DataFusion's optimizer makes that join a semi join, which
     ddx can't differentiate: ``UnsupportedExpression: a JOIN_TYPE_RIGHT_SEMI
-    join on the path from a wrt table to the output``. Reading the index
-    first, which saves it as a table, avoids it."""
+    join on the path from a wrt table to the output``. backward() saves an
+    integer node as a table, as reading it first would, which keeps the
+    join out of ddx's program (issue #22)."""
     import torch_sql
 
     with torch_sql.Environment(make_engine(engine)):

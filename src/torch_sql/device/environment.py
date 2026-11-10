@@ -443,14 +443,15 @@ class Environment:
         result = self.dispatch(functional, (), args, kwargs)
         return target.write(result._node)
 
-    def _target(self, func, tensor: Tensor, args=None, kwargs=None) -> _Target:
+    def _target(self, func, tensor: Tensor, args=None, kwargs=None, *, reads=None) -> _Target:
         """``tensor``, as the target of a write by ``func``, once every check
         of the write has passed (§8.6). Each way of writing a tensor (an
         in-place op, ``out=``, ``copy_``) makes its target here before it
         computes anything, and writes only through the target.
 
         With ``args``, PyTorch's own checks of the call run as well: shapes
-        that don't broadcast to the target, a cast it refuses."""
+        that don't broadcast to the target, a cast it refuses. ``reads``
+        holds the write's other inputs, ``(args, kwargs)`` by default."""
         # PyTorch marks a view's wrapper itself (``_is_view``), above the
         # dispatch that reaches torch-sql. ``.detach()`` and ``nn.Parameter``
         # aren't views, and hold their owner's values.
@@ -466,6 +467,12 @@ class Environment:
             )
         if args is not None:
             self._meta(func, args, kwargs or {})
+        if reads is None:
+            reads = (args, kwargs)
+        if torch.is_grad_enabled() and (tensor.requires_grad or _requires_grad(*reads)):
+            # Autograd records the write, and the tensor has a history from
+            # now on, which an alias taken before must see (issue #21).
+            tensor._storage.history = True
         return _Target(tensor)
 
 
@@ -552,10 +559,11 @@ def _untracked(target: Tensor) -> bool:
     gives the tensor the write's node, which a stop-gradient cuts from it.
     Autograd records the write only if gradients are enabled and the target
     is the tensor with the history, not a ``.detach()`` alias of it. An
-    alias's base counts if it had its history when the alias was taken."""
+    alias's base counts if it had its history when the alias was taken, or
+    gained it since through a recorded write."""
     if torch.is_grad_enabled() and target.grad_fn is not None:
         return False
-    return target.grad_fn is not None or target._lineage.history
+    return target.grad_fn is not None or target._lineage.history or target._storage.history
 
 
 def _requires_grad(args, kwargs) -> bool:
@@ -614,7 +622,7 @@ def _foreach(env: Environment, func, args, kwargs):
     positional = [a for a in plain._schema.arguments if not a.kwarg_only]
     keyword = [a for a in plain._schema.arguments if a.kwarg_only]
     if assign:
-        targets = [env._target(func, t) for t in provided[0][1]]
+        targets = [env._target(func, t, reads=(args, kwargs)) for t in provided[0][1]]
         env._meta(func, args, kwargs)
     results = []
     for i in range(n):
@@ -669,7 +677,7 @@ def _to_device(
 def _copy_(env: Environment, dst, src, non_blocking=False):
     if not isinstance(dst, Tensor):
         raise RuntimeError("copying a torch-sql tensor into a CPU tensor: use .cpu()")
-    target = env._target(aten.copy_.default, dst)
+    target = env._target(aten.copy_.default, dst, reads=((src,), {}))
     if not isinstance(src, Tensor):
         src = env.tensor(src.detach().to(dst.dtype))
     if tuple(src.shape) != tuple(dst.shape):
