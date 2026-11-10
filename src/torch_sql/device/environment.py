@@ -467,13 +467,9 @@ class Environment:
             )
         if args is not None:
             self._meta(func, args, kwargs or {})
-        if reads is None:
-            reads = (args, kwargs)
-        if torch.is_grad_enabled() and (tensor.requires_grad or _requires_grad(*reads)):
-            # Autograd records the write, and the tensor has a history from
-            # now on, which an alias taken before must see (issue #21).
-            tensor._storage.history = True
-        return _Target(tensor)
+        target = _Target(tensor)
+        target.reads(*((args, kwargs) if reads is None else reads))
+        return target
 
 
 def _functional_of(func):
@@ -527,10 +523,17 @@ class _Target:
     """A tensor that a write may change, made by
     :meth:`Environment._target` once the write's checks have passed."""
 
-    __slots__ = ("tensor",)
+    __slots__ = ("tensor", "recorded")
 
     def __init__(self, tensor: Tensor):
-        self.tensor = tensor
+        self.tensor, self.recorded = tensor, False
+
+    def reads(self, args, kwargs):
+        """The write's other inputs: whether autograd records the write, and
+        so gives the tensor a history, depends on them."""
+        self.recorded = torch.is_grad_enabled() and (
+            self.tensor.requires_grad or _requires_grad(args, kwargs)
+        )
 
     def write(self, node: g.Node) -> Tensor:
         """Give the tensor ``node``'s value, cast to its dtype as PyTorch
@@ -549,6 +552,10 @@ class _Target:
                 value=as_dtype(g.Col(0, "v"), node.dtype, t.dtype),
             )
         t._write(node)
+        if self.recorded:
+            # The tensor has a history from now on, which an alias taken
+            # before must see (issue #21).
+            t._storage.history = True
         return t
 
 
@@ -622,7 +629,7 @@ def _foreach(env: Environment, func, args, kwargs):
     positional = [a for a in plain._schema.arguments if not a.kwarg_only]
     keyword = [a for a in plain._schema.arguments if a.kwarg_only]
     if assign:
-        targets = [env._target(func, t, reads=(args, kwargs)) for t in provided[0][1]]
+        targets = [env._target(func, t, reads=((), {})) for t in provided[0][1]]
         env._meta(func, args, kwargs)
     results = []
     for i in range(n):
@@ -630,6 +637,8 @@ def _foreach(env: Environment, func, args, kwargs):
         call_args = values[: len(positional)]
         call_kwargs = {a.name: v for a, v in zip(keyword, values[len(positional) :], strict=False)}
         results.append(plain(*call_args, **call_kwargs))
+        if assign:  # autograd records each element's write apart
+            targets[i].reads(call_args, call_kwargs)
     if assign:
         for target, result in zip(targets, results, strict=True):
             target.write(result._node)
