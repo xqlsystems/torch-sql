@@ -67,7 +67,7 @@ def measured(monkeypatch):
     def query(root, saved=None, **kwargs):
         known = saved or {}
         if _summed_cotangent(root, known):
-            # A known finding: look past it by counting the cotangent as the
+            # A known finding (#23): look past it by counting the cotangent as the
             # table it should be saved as.
             known = {**known, root.inputs[1].id: g.Table(root.inputs[1].shape, torch.float64)}
         seen.append(inlined_size(root, known))
@@ -96,7 +96,9 @@ def test_no_query_passes_the_budget(measured, program, budget):
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="a cut point's cotangents are summed inside its VJP query")
+@pytest.mark.xfail(
+    strict=True, reason="#23: a cut point's cotangents are summed inside its VJP query"
+)
 def test_a_cotangent_of_many_parts_stays_within_the_budget(measured, monkeypatch):
     """A cut point read by k later segments gets k cotangent tables, and
     ``program.total`` sums them inside the cut point's vector-Jacobian

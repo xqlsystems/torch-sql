@@ -288,7 +288,7 @@ def test_assigning_data(engine, how):
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="an alias's history is decided when it's taken")
+@pytest.mark.xfail(strict=True, reason="#21: an alias's history is decided when it's taken")
 @pytest.mark.parametrize("engine", sorted(engines.ENGINES))
 @pytest.mark.parametrize("no_grad", [False, True])
 def test_alias_taken_before_its_base_had_history(engine, no_grad):

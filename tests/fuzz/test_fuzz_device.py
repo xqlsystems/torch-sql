@@ -294,7 +294,7 @@ def test_gradient_of_a_sum_of_an_expand(engine):
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="max(dim)'s gradient at a tie is split, as amax's")
+@pytest.mark.xfail(strict=True, reason="#20: max(dim)'s gradient at a tie is split, as amax's")
 @pytest.mark.parametrize("engine", ENGINES)
 @pytest.mark.parametrize("fn", ["max", "min"])
 def test_gradient_of_max_along_a_dim_at_a_tie(engine, fn):
@@ -324,7 +324,9 @@ def test_gradient_of_max_along_a_dim_at_a_tie(engine, fn):
     [
         pytest.param(
             "datafusion",
-            marks=pytest.mark.xfail(strict=True, reason="ddx can't differentiate a RightSemi join"),
+            marks=pytest.mark.xfail(
+                strict=True, reason="#22: ddx can't differentiate a RightSemi join"
+            ),
         ),
         "duckdb",
     ],
