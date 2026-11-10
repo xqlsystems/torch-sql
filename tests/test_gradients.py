@@ -569,3 +569,30 @@ def test_view_of_a_leaf_written_without_grad(env):
     assert v.detach().cpu().tolist() == [0.5, 0.5, 0.5]
     (v * 2).sum().backward()
     assert x.grad.cpu().tolist() == [[0.0] * 3, [2.0] * 3]
+
+
+def test_foreach_write_marks_only_the_targets_autograd_records(env):
+    # Only a's write reads a tensor that requires a gradient, so b keeps no
+    # history, and an untracked write to b is allowed, as in PyTorch.
+    # _foreach_maximum_ has no in-place plain op, so torch-sql assigns it.
+    a, b = torch.zeros(2, dtype=F64).to("sql"), torch.zeros(2, dtype=F64).to("sql")
+    wa = torch.ones(2, dtype=F64).to("sql").requires_grad_()
+    c = torch.ones(2, dtype=F64).to("sql")
+    torch._foreach_maximum_([a, b], [wa, c])
+    with torch.no_grad():
+        b.mul_(2)
+    assert b.cpu().tolist() == [2.0, 2.0]
+
+
+def test_a_failed_write_gives_no_history(env):
+    # The refused write leaves y without a grad_fn, so a later untracked
+    # write through d is allowed.
+    y = torch.zeros(3, dtype=F64).to("sql")
+    w = torch.ones(3, dtype=F64).to("sql").requires_grad_()
+    d = y.detach()
+    with pytest.raises(NotImplementedError):
+        y.div_(w, rounding_mode="floor")
+    assert y.grad_fn is None
+    with torch.no_grad():
+        d.add_(1)
+    assert y.cpu().tolist() == [1.0, 1.0, 1.0]

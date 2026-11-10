@@ -151,18 +151,43 @@ def argmin(ctx, x, dim=None, keepdim=False):
     return _arg_extremum(ctx, x, dim, keepdim, amin, ctx.out.shape)
 
 
+def _extremum_dim(ctx, x, dim, keepdim, extremum):
+    """``max(dim)`` and ``min(dim)``: the indices, and the values of ``x``
+    at them. PyTorch gives the values' gradient to the element each index
+    names, where ``amax`` splits it among tied elements (issue #20), so the
+    values are read through the indices rather than computed apart."""
+    values, indices = ctx.out
+    if x.rank == 0:
+        return extremum(Context(ctx.func, values, ctx.env), x, (dim,), keepdim), (
+            _arg_extremum(ctx, x, dim, keepdim, extremum, indices.shape)
+        )
+    dim %= x.rank
+    index = _arg_extremum(ctx, x, dim, keepdim, extremum, indices.shape)
+    kept = [d for d in range(x.rank) if d != dim]
+    on = [(g.Col(0, x.columns[dim]), g.Col(1, "v"))]
+    on += [
+        (g.Col(0, x.columns[d]), g.Col(1, index.columns[d if keepdim else k]))
+        for k, d in enumerate(kept)
+    ]
+    at = g.Select(
+        tuple(values.shape),
+        values.dtype,
+        (x, index),
+        on=tuple(on),
+        index=tuple(g.Col(1, c) for c in index.columns),
+        value=g.Col(0, "v"),
+    )
+    return at, index
+
+
 @op(aten.max.dim)
 def max_dim(ctx, x, dim, keepdim=False):
-    values, indices = ctx.out
-    meta = Context(ctx.func, values, ctx.env)
-    return amax(meta, x, (dim,), keepdim), _arg_extremum(ctx, x, dim, keepdim, amax, indices.shape)
+    return _extremum_dim(ctx, x, dim, keepdim, amax)
 
 
 @op(aten.min.dim)
 def min_dim(ctx, x, dim, keepdim=False):
-    values, indices = ctx.out
-    meta = Context(ctx.func, values, ctx.env)
-    return amin(meta, x, (dim,), keepdim), _arg_extremum(ctx, x, dim, keepdim, amin, indices.shape)
+    return _extremum_dim(ctx, x, dim, keepdim, amin)
 
 
 def _truth_reduce(ctx, x, dim, keepdim, agg):

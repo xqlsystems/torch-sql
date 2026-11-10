@@ -741,8 +741,11 @@ It holds no strides. A view (§8.5) is a different query over the same table.
 ### 8.2 Dtypes
 
 Float64 is the default for verification, because it makes disagreements with
-PyTorch easy to see. Float32 is supported. Integer and boolean tensors are
-supported for indices and masks. bfloat16 and other low-precision types are
+PyTorch easy to see. Integer and boolean tensors are supported for indices
+and masks. Float32 isn't supported yet. Samudra's production configuration
+trains in it (§7.3), and both SQL engines have it, as `REAL`, so it comes
+before Samudra training (M3, §16); the reductions and the NaN checks of
+§9.4 need checking in it. bfloat16 and other low-precision types are
 open (§17), since neither SQL engine has them and einfold only handles
 `DOUBLE` today. An op whose result PyTorch gives in an unsupported dtype,
 such as `int / int`, which is float32, is refused with an error.
@@ -847,7 +850,9 @@ from PyTorch. A use that *saved* a value later written (`c = w * w`, then
 operation" error, from PyTorch's check of its saved tensors. And an
 in-place op autograd doesn't record (under `no_grad`, or through
 `.detach()`) on a tensor with a `grad_fn` is refused, since torch-sql would
-cut the tensor's history (D17).
+cut the tensor's history (D17). That includes a write through an alias taken
+before the tensor had its `grad_fn`: the storage records that a write
+autograd recorded gave one of its tensors a history.
 
 ### 8.7 Small constants
 
@@ -941,6 +946,7 @@ version covers what nanoGPT and Samudra use, plus the optimizer's ops.
 | `gelu` | `erf`, which no engine has yet (§7.3 item 5); the tanh form until then |
 | `mm`, `bmm`, `linear`, `einsum` | a join on the contracted index, `SUM(a * b)` grouped by the rest |
 | `sum`, `mean`, `amax` | `GROUP BY` the kept indices |
+| `argmax`, `max(dim)` | `amax` joined back to `x`, then the least matching index; `max(dim)`'s values are `x` joined to that index, so the gradient goes to it, as in PyTorch |
 | `softmax`, `log_softmax` | a `MAX` for the shift, then a `SUM` for the normalizer |
 | `conv2d` (any dilation, circular or zero padding) | a join through index tables (§9.5) |
 | `avg_pool2d` | a join through a pooling index table, then `AVG` |
@@ -1158,6 +1164,12 @@ a value that gets no gradient. It must be registered on the session first
 (`ddxdb.ad.register_stop_gradient`, spike S3), which takes only DOUBLE
 ([ddx#260](https://github.com/xqlsystems/ddx/issues/260)). Samudra uses this to cut the rollout's gradient
 every few steps.
+
+An integer or boolean value, such as an index from `argmax` or a mask, gets no
+gradient either. `backward()` saves each one as a table before it calls ddx,
+so its query stays out of the program ddx differentiates. This matters for
+`x.gather(1, x.argmax(1, keepdim=True))`: DataFusion plans `argmax`'s join as
+a semi join, which ddx can't differentiate yet.
 
 ### 11.4 Forward values besides the loss
 

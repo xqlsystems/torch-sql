@@ -275,6 +275,15 @@ class Environment:
                 # to C++; _Factories makes those torch-sql tensors.
                 with _Factories(self):
                     return decomposition(*args, **kwargs)
+            if torch._C._dispatch_has_kernel_for_dispatch_key(
+                func.name(), "CompositeImplicitAutograd"
+            ):
+                # An op PyTorch writes in C++ as simpler ops, such as
+                # flatten, which PyTorch's Python decompositions call
+                # (issue #27). Above the dispatcher, PyTorch runs this
+                # itself; inside a decomposition, torch-sql must.
+                with _Factories(self):
+                    return func.decompose(*args, **kwargs)
             raise OperatorNotFound(
                 f"torch-sql has no lowering for {func}, and PyTorch has no decomposition of it"
             )
@@ -443,14 +452,15 @@ class Environment:
         result = self.dispatch(functional, (), args, kwargs)
         return target.write(result._node)
 
-    def _target(self, func, tensor: Tensor, args=None, kwargs=None) -> _Target:
+    def _target(self, func, tensor: Tensor, args=None, kwargs=None, *, reads=None) -> _Target:
         """``tensor``, as the target of a write by ``func``, once every check
         of the write has passed (§8.6). Each way of writing a tensor (an
         in-place op, ``out=``, ``copy_``) makes its target here before it
         computes anything, and writes only through the target.
 
         With ``args``, PyTorch's own checks of the call run as well: shapes
-        that don't broadcast to the target, a cast it refuses."""
+        that don't broadcast to the target, a cast it refuses. ``reads``
+        holds the write's other inputs, ``(args, kwargs)`` by default."""
         # PyTorch marks a view's wrapper itself (``_is_view``), above the
         # dispatch that reaches torch-sql. ``.detach()`` and ``nn.Parameter``
         # aren't views, and hold their owner's values.
@@ -466,7 +476,9 @@ class Environment:
             )
         if args is not None:
             self._meta(func, args, kwargs or {})
-        return _Target(tensor)
+        target = _Target(tensor)
+        target.reads(*((args, kwargs) if reads is None else reads))
+        return target
 
 
 def _functional_of(func):
@@ -520,10 +532,17 @@ class _Target:
     """A tensor that a write may change, made by
     :meth:`Environment._target` once the write's checks have passed."""
 
-    __slots__ = ("tensor",)
+    __slots__ = ("tensor", "recorded")
 
     def __init__(self, tensor: Tensor):
-        self.tensor = tensor
+        self.tensor, self.recorded = tensor, False
+
+    def reads(self, args, kwargs):
+        """The write's other inputs: whether autograd records the write, and
+        so gives the tensor a history, depends on them."""
+        self.recorded = torch.is_grad_enabled() and (
+            self.tensor.requires_grad or _requires_grad(args, kwargs)
+        )
 
     def write(self, node: g.Node) -> Tensor:
         """Give the tensor ``node``'s value, cast to its dtype as PyTorch
@@ -542,6 +561,10 @@ class _Target:
                 value=as_dtype(g.Col(0, "v"), node.dtype, t.dtype),
             )
         t._write(node)
+        if self.recorded:
+            # The tensor has a history from now on, which an alias taken
+            # before must see (issue #21).
+            t._storage.history = True
         return t
 
 
@@ -552,10 +575,11 @@ def _untracked(target: Tensor) -> bool:
     gives the tensor the write's node, which a stop-gradient cuts from it.
     Autograd records the write only if gradients are enabled and the target
     is the tensor with the history, not a ``.detach()`` alias of it. An
-    alias's base counts if it had its history when the alias was taken."""
+    alias's base counts if it had its history when the alias was taken, or
+    gained it since through a recorded write."""
     if torch.is_grad_enabled() and target.grad_fn is not None:
         return False
-    return target.grad_fn is not None or target._lineage.history
+    return target.grad_fn is not None or target._lineage.history or target._storage.history
 
 
 def _requires_grad(args, kwargs) -> bool:
@@ -614,7 +638,7 @@ def _foreach(env: Environment, func, args, kwargs):
     positional = [a for a in plain._schema.arguments if not a.kwarg_only]
     keyword = [a for a in plain._schema.arguments if a.kwarg_only]
     if assign:
-        targets = [env._target(func, t) for t in provided[0][1]]
+        targets = [env._target(func, t, reads=((), {})) for t in provided[0][1]]
         env._meta(func, args, kwargs)
     results = []
     for i in range(n):
@@ -622,6 +646,8 @@ def _foreach(env: Environment, func, args, kwargs):
         call_args = values[: len(positional)]
         call_kwargs = {a.name: v for a, v in zip(keyword, values[len(positional) :], strict=False)}
         results.append(plain(*call_args, **call_kwargs))
+        if assign:  # autograd records each element's write apart
+            targets[i].reads(call_args, call_kwargs)
     if assign:
         for target, result in zip(targets, results, strict=True):
             target.write(result._node)
@@ -669,7 +695,7 @@ def _to_device(
 def _copy_(env: Environment, dst, src, non_blocking=False):
     if not isinstance(dst, Tensor):
         raise RuntimeError("copying a torch-sql tensor into a CPU tensor: use .cpu()")
-    target = env._target(aten.copy_.default, dst)
+    target = env._target(aten.copy_.default, dst, reads=((src,), {}))
     if not isinstance(src, Tensor):
         src = env.tensor(src.detach().to(dst.dtype))
     if tuple(src.shape) != tuple(dst.shape):

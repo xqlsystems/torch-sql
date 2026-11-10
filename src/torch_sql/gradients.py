@@ -14,7 +14,11 @@ their say, so torch-sql reads the leaves from there.
 
 **Stopping gradients** (§11.3). A node marked ``stop_gradient``
 (``.detach()``, or a value computed under ``torch.no_grad()`` from one that
-requires a gradient) is saved as a table first. A table that isn't a
+requires a gradient) is saved as a table first, and so is an integer or
+boolean node (an index, a mask), through which no gradient flows either.
+Saving one also keeps its query out of ddx's program: ddx can't
+differentiate the semi join that DataFusion makes of ``argmax``'s join
+(issue #22). A table that isn't a
 ``wrt`` table is a constant to ddx, so no gradient flows through it. ddx has
 a function for this, ``ddx_stop_gradient``, but ddxdb registers it only on
 DataFusion, and only for DOUBLE (xqlsystems/ddx#260); saving a table works
@@ -109,7 +113,8 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
                 resolve[old.id] = t._node
             else:
                 earlier.setdefault(old.id, k)
-    # Each stop-gradient node as a table, which ddx treats as a constant.
+    # Each stop-gradient node, and each integer or boolean one, as a table,
+    # which ddx treats as a constant.
     # Each earlier value of a leaf that the loss reads as a table of its
     # own, which ddx also differentiates with respect to: the leaf's
     # gradient is the sum over all of them, as PyTorch's AccumulateGrad sums
@@ -128,7 +133,7 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
             k, _ = owned.setdefault(table.id, (earlier[node.id], table))
             if k != earlier[node.id]:
                 raise AssertionError("two leaves share one table; their gradients would mix")
-        elif isinstance(node, g.Select) and node.stop_gradient:
+        elif (isinstance(node, g.Select) and node.stop_gradient) or node.dtype != torch.float64:
             resolve[node.id] = env.materialize(node)
         else:
             stack.extend(node.inputs)
