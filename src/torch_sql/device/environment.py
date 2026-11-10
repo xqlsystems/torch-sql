@@ -415,13 +415,7 @@ class Environment:
             )
         if not isinstance(target, Tensor):
             raise RuntimeError(f"{func} on a tensor that isn't torch-sql's")
-        # PyTorch marks a view's wrapper itself (``_is_view``), above the
-        # dispatch that reaches torch-sql. ``.detach()`` and ``nn.Parameter``
-        # aren't views.
-        if target._is_view():
-            raise NotImplementedError(
-                f"{func} writes through a view, which torch-sql doesn't support (design §8.6)"
-            )
+        target = self._target(func, target, args, kwargs)
         functional = FUNCTIONAL.get(func)
         if functional is None:
             name = func._schema.name.split("::")[1]
@@ -429,12 +423,8 @@ class Environment:
             functional = getattr(packet, func._overloadname, None) if packet else None
         if functional is None:
             raise OperatorNotFound(f"torch-sql has no lowering for {func}")
-        # PyTorch's checks of the in-place call itself: shapes that don't
-        # broadcast to the target, a cast it refuses.
-        self._meta(func, args, kwargs)
         result = self.dispatch(functional, (), args, kwargs)
-        self._assign(target, result._node)
-        return target
+        return target.write(result._node)
 
     def _out(self, func, args, kwargs):
         """An op with ``out=``, such as ``torch.maximum(a, b, out=a)`` in
@@ -445,40 +435,38 @@ class Environment:
         functional = _functional_of(func)
         if functional is None or not isinstance(target, Tensor):
             raise NotImplementedError(f"{func} with out=")
-        if target._is_view():
-            raise NotImplementedError(
-                f"{func} writes through a view, which torch-sql doesn't support (design §8.6)"
-            )
         out = self._meta(functional, args, kwargs)
         if not isinstance(out, torch.Tensor) or out.shape != target.shape:
             # PyTorch resizes out=; torch-sql's tensors keep their shape.
             raise NotImplementedError(f"{func} with an out= of another shape")
-        # PyTorch's checks of the call with out=, such as a cast it refuses.
-        self._meta(func, args, {**kwargs, "out": target})
+        target = self._target(func, target, args, {**kwargs, "out": target})
         result = self.dispatch(functional, (), args, kwargs)
-        self._assign(target, result._node)
-        return target
+        return target.write(result._node)
 
-    def _assign(self, target: Tensor, node: g.Node):
-        if _untracked(target):
+    def _target(self, func, tensor: Tensor, args=None, kwargs=None) -> _Target:
+        """``tensor``, as the target of a write by ``func``, once every check
+        of the write has passed (§8.6). Each way of writing a tensor (an
+        in-place op, ``out=``, ``copy_``) makes its target here before it
+        computes anything, and writes only through the target.
+
+        With ``args``, PyTorch's own checks of the call run as well: shapes
+        that don't broadcast to the target, a cast it refuses."""
+        # PyTorch marks a view's wrapper itself (``_is_view``), above the
+        # dispatch that reaches torch-sql. ``.detach()`` and ``nn.Parameter``
+        # aren't views, and hold their owner's values.
+        if tensor._is_view() or not tensor._lineage.same_values:
+            raise NotImplementedError(
+                f"{func} writes through a view, which torch-sql doesn't support (design §8.6)"
+            )
+        if _untracked(tensor):
             raise NotImplementedError(
                 "an in-place op that autograd doesn't record (under torch.no_grad(), or "
                 "through .detach() or .data) on a tensor with a grad_fn: PyTorch keeps the "
                 "tensor's gradient, which torch-sql can't yet (design §8.6, issue #18)"
             )
-        if node.shape != target._node.shape:
-            raise AssertionError(f"in-place result {node.shape} for {target._node.shape}")
-        if node.dtype != target.dtype:
-            from ..ops._build import as_dtype
-
-            node = g.Select(
-                node.shape,
-                target.dtype,
-                (node,),
-                index=tuple(g.Col(0, c) for c in node.columns),
-                value=as_dtype(g.Col(0, "v"), node.dtype, target.dtype),
-            )
-        target._write(node)
+        if args is not None:
+            self._meta(func, args, kwargs or {})
+        return _Target(tensor)
 
 
 def _functional_of(func):
@@ -526,6 +514,35 @@ def _stopped(nodes):
         else n,
         nodes,
     )
+
+
+class _Target:
+    """A tensor that a write may change, made by
+    :meth:`Environment._target` once the write's checks have passed."""
+
+    __slots__ = ("tensor",)
+
+    def __init__(self, tensor: Tensor):
+        self.tensor = tensor
+
+    def write(self, node: g.Node) -> Tensor:
+        """Give the tensor ``node``'s value, cast to its dtype as PyTorch
+        casts an in-place op's result, and return the tensor."""
+        t = self.tensor
+        if node.shape != t._node.shape:
+            raise AssertionError(f"in-place result {node.shape} for {t._node.shape}")
+        if node.dtype != t.dtype:
+            from ..ops._build import as_dtype
+
+            node = g.Select(
+                node.shape,
+                t.dtype,
+                (node,),
+                index=tuple(g.Col(0, c) for c in node.columns),
+                value=as_dtype(g.Col(0, "v"), node.dtype, t.dtype),
+            )
+        t._write(node)
+        return t
 
 
 def _untracked(target: Tensor) -> bool:
@@ -596,6 +613,9 @@ def _foreach(env: Environment, func, args, kwargs):
     plain = plain or packet.default
     positional = [a for a in plain._schema.arguments if not a.kwarg_only]
     keyword = [a for a in plain._schema.arguments if a.kwarg_only]
+    if assign:
+        targets = [env._target(func, t) for t in provided[0][1]]
+        env._meta(func, args, kwargs)
     results = []
     for i in range(n):
         values = [element(a, v, i) for a, v in provided]
@@ -603,10 +623,8 @@ def _foreach(env: Environment, func, args, kwargs):
         call_kwargs = {a.name: v for a, v in zip(keyword, values[len(positional) :], strict=False)}
         results.append(plain(*call_args, **call_kwargs))
     if assign:
-        for target, result in zip(provided[0][1], results, strict=True):
-            if target._is_view():
-                raise NotImplementedError(f"{func} writes through a view (design §8.6)")
-            env._assign(target, result._node)
+        for target, result in zip(targets, results, strict=True):
+            target.write(result._node)
     return None if not schema.returns else results
 
 
@@ -651,8 +669,7 @@ def _to_device(
 def _copy_(env: Environment, dst, src, non_blocking=False):
     if not isinstance(dst, Tensor):
         raise RuntimeError("copying a torch-sql tensor into a CPU tensor: use .cpu()")
-    if dst._is_view():
-        raise NotImplementedError("copy_ writes through a view (design §8.6)")
+    target = env._target(aten.copy_.default, dst)
     if not isinstance(src, Tensor):
         src = env.tensor(src.detach().to(dst.dtype))
     if tuple(src.shape) != tuple(dst.shape):
@@ -661,17 +678,14 @@ def _copy_(env: Environment, dst, src, non_blocking=False):
     # they'd share a table, and their gradients would mix. Under no_grad
     # (load_state_dict), the copy is a constant, as in PyTorch.
     stop = not torch.is_grad_enabled() and src.requires_grad
-    env._assign(dst, g.identity(src._node, stop_gradient=stop))
-    return dst
+    return target.write(g.identity(src._node, stop_gradient=stop))
 
 
 def _bernoulli_(env: Environment, x, p=0.5, *, generator=None):
     """In place, with ``p``'s default, which the functional form lacks."""
-    if x._is_view():
-        raise NotImplementedError("bernoulli_ writes through a view (design §8.6)")
+    target = env._target(aten.bernoulli_.float, x)
     cpu = torch.empty(tuple(x.shape), dtype=x.dtype).bernoulli_(p, generator=generator)
-    env._assign(x, env.upload(cpu))
-    return x
+    return target.write(env.upload(cpu))
 
 
 def _scalar(env: Environment, x):

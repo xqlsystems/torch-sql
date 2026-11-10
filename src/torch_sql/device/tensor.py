@@ -174,12 +174,9 @@ class Tensor(torch.Tensor):
         self._lineage = other._lineage
 
     def _write(self, node: g.Node):
-        """An in-place op's result: a new value, which every alias sees."""
-        if not self._lineage.same_values:
-            raise NotImplementedError(
-                "an in-place op writes through a view, which torch-sql doesn't support "
-                "(design §8.6)"
-            )
+        """A new value, which every alias sees. Only a write's target
+        (``Environment._target``) calls this, once the write's checks have
+        passed."""
         self._storage.node = node
         self._table = None
         self._storage.table = None
