@@ -288,3 +288,62 @@ def test_gradient_of_a_sum_of_an_expand(engine):
         w = torch.tensor([-1.0], dtype=torch.float64, device="sql").requires_grad_()
         w.expand(2).sum().backward()
         assert w.grad.cpu().tolist() == [2.0]
+
+
+# -- Pinned findings ---------------------------------------------------------
+
+
+@pytest.mark.pinned
+@pytest.mark.xfail(strict=True, reason="max(dim)'s gradient at a tie is split, as amax's")
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("fn", ["max", "min"])
+def test_gradient_of_max_along_a_dim_at_a_tie(engine, fn):
+    """``x.max(dim)`` returns values and indices, and PyTorch's gradient of
+    the values goes to the returned index only. ``amax`` splits it among
+    the tied elements, and torch-sql lowers ``max.dim``'s values as
+    ``amax``, so a row ``[1, 3, 3]`` gets ``[0, 0.5, 0.5]`` where PyTorch
+    gives ``[0, 1, 0]``."""
+    import torch_sql
+
+    def program(device):
+        x = torch.tensor([[1.0, 3.0, 3.0], [0.0, 0.0, 0.0]], dtype=torch.float64)
+        x = (x.to("sql") if device == "sql" else x).requires_grad_()
+        values = getattr(x if fn == "max" else -x, fn)(1).values
+        values.sum().backward()
+        return x.grad.cpu()
+
+    expected = program("cpu")
+    with torch_sql.Environment(make_engine(engine)):
+        got = program("sql")
+    assert torch.equal(got, expected), f"got {got.tolist()}, PyTorch {expected.tolist()}"
+
+
+@pytest.mark.pinned
+@pytest.mark.parametrize(
+    "engine",
+    [
+        pytest.param(
+            "datafusion",
+            marks=pytest.mark.xfail(strict=True, reason="ddx can't differentiate a RightSemi join"),
+        ),
+        "duckdb",
+    ],
+)
+@pytest.mark.parametrize("how", ["argmax", "max_indices"])
+def test_gradient_through_a_gather_by_argmax(engine, how):
+    """``argmax`` joins ``x`` with its maximum and reads only ``x``'s
+    columns, and DataFusion's optimizer makes that join a semi join, which
+    ddx can't differentiate: ``UnsupportedExpression: a JOIN_TYPE_RIGHT_SEMI
+    join on the path from a wrt table to the output``. Reading the index
+    first, which saves it as a table, avoids it."""
+    import torch_sql
+
+    with torch_sql.Environment(make_engine(engine)):
+        w = torch.tensor([[1.0, 5.0, 2.0], [7.0, 0.0, 3.0]], dtype=torch.float64)
+        w = w.to("sql").requires_grad_()
+        if how == "argmax":
+            index = w.detach().argmax(1, keepdim=True)
+        else:
+            index = w.max(1, keepdim=True).indices
+        w.gather(1, index).sum().backward()
+        assert w.grad.cpu().tolist() == [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]

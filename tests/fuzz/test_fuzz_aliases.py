@@ -280,3 +280,45 @@ def test_assigning_data(engine, how):
         got = program("sql")
     for a, b in zip(got, expected, strict=True):
         torch.testing.assert_close(a, b)
+
+
+# -- Pinned findings ---------------------------------------------------------
+# Each is a strict xfail: it passes once the bug is fixed, then fails until
+# the marker goes.
+
+
+@pytest.mark.pinned
+@pytest.mark.xfail(strict=True, reason="an alias's history is decided when it's taken")
+@pytest.mark.parametrize("engine", sorted(engines.ENGINES))
+@pytest.mark.parametrize("no_grad", [False, True])
+def test_alias_taken_before_its_base_had_history(engine, no_grad):
+    """``d = y.detach()`` is taken while ``y`` has no ``grad_fn``; then a
+    tracked ``y.add_(w)`` gives ``y`` one. A write through ``d`` now changes
+    ``y``'s value without autograd recording it, which #18 refuses. But
+    ``Lineage.history`` was decided when ``d`` was taken, so the write is
+    allowed, cuts ``y`` from its history, and ``w.grad`` is 0 where PyTorch
+    gives 1."""
+
+    def program(device):
+        w = torch.tensor([1.0, 2.0, 3.0], dtype=F64)
+        y = torch.zeros(3, dtype=F64)
+        if device == "sql":
+            w, y = w.to("sql"), y.to("sql")
+        w.requires_grad_()
+        d = y.detach()
+        y.add_(w)
+        if no_grad:
+            with torch.no_grad():
+                d.mul_(2)
+        else:
+            d.mul_(2)
+        y.sum().backward()
+        return w.grad.cpu()
+
+    expected = program("cpu")
+    try:
+        with torch_sql.Environment(make_engine(engine)):
+            got = program("sql")
+    except NotImplementedError:
+        return  # refused, as #18 does: also a fix
+    assert torch.equal(got, expected), f"got {got.tolist()}, PyTorch {expected.tolist()}"
