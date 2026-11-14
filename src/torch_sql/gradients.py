@@ -133,7 +133,9 @@ def backward(loss, gradient=None, retain_graph=None, create_graph=False, inputs=
             k, _ = owned.setdefault(table.id, (earlier[node.id], table))
             if k != earlier[node.id]:
                 raise AssertionError("two leaves share one table; their gradients would mix")
-        elif (isinstance(node, g.Select) and node.stop_gradient) or node.dtype != torch.float64:
+        elif not node.dtype.is_floating_point or (
+            isinstance(node, g.Select) and node.stop_gradient
+        ):
             resolve[node.id] = env.materialize(node)
         else:
             stack.extend(node.inputs)

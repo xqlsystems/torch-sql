@@ -1168,8 +1168,10 @@ every few steps.
 An integer or boolean value, such as an index from `argmax` or a mask, gets no
 gradient either. `backward()` saves each one as a table before it calls ddx,
 so its query stays out of the program ddx differentiates. This matters for
-`x.gather(1, x.argmax(1, keepdim=True))`: DataFusion plans `argmax`'s join as
-a semi join, which ddx can't differentiate yet.
+`x.gather(1, x.argmax(1, keepdim=True))`. `argmax` joins `x` to its maximum
+(§9.4) and reads only `x`'s columns, so DataFusion plans the join as a *semi
+join*, which keeps each row of one side that has a match on the other and
+reads nothing from the other side. ddx can't differentiate a semi join yet.
 
 ### 11.4 Forward values besides the loss
 
