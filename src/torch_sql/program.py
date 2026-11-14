@@ -28,7 +28,9 @@ rule runs over the segments in reverse, as autograd runs over ops:
 2. For each cut point, latest first, ddx differentiates
    ``SUM(value * cotangent)`` over its segment, with the cotangent held
    constant. That's the vector-Jacobian product of the segment, and it
-   gives the leaves and earlier cut points their share.
+   gives the leaves and earlier cut points their share. A cut point that
+   several segments read gets a cotangent from each, and their sum is saved
+   as a table first.
 
 Each segment is one ddx program, and each leaf's gradient is the sum of its
 shares.
@@ -148,7 +150,10 @@ def backward(env, objective: g.Node, resolve: dict, wrt: list[g.Table]):
     for node in reversed(cuts):
         if not cotangents[node.id]:
             continue
-        cotangent = total(cotangents.pop(node.id))
+        parts = cotangents.pop(node.id)
+        # Saved once, rather than summed inside the VJP's query, which would
+        # then grow with the number of readers, past the budget (issue #23).
+        cotangent = parts[0] if len(parts) == 1 else _save(env, total(parts), resolve)
         on = tuple((g.Col(0, c), g.Col(1, c)) for c in node.columns)
         vjp = g.Select(
             (),

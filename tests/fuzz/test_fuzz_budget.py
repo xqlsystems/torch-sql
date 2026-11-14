@@ -10,8 +10,6 @@ the program sends, forward and backward, by measuring the graph that
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 from fuzz_programs import leaf_tensors, output_of, programs, run
@@ -44,20 +42,6 @@ def inlined_size(root: g.Node, saved) -> tuple[int, int]:
     return sizes[saved.get(root.id, root).id], widest
 
 
-def _summed_cotangent(root: g.Node, saved) -> bool:
-    """Whether ``root`` is a cut point's vector-Jacobian product whose
-    cotangent is a sum of several tables, written into the query rather
-    than saved (program.total)."""
-    if os.environ.get("TORCH_SQL_FUZZ_KNOWN", "1") == "0":
-        return False
-    if not (isinstance(root, g.Select) and root.group and len(root.inputs) == 2):
-        return False
-    cotangent = saved.get(root.inputs[1].id, root.inputs[1])
-    return isinstance(cotangent, g.Select) and any(
-        isinstance(i, g.UnionAll) for i in cotangent.inputs
-    )
-
-
 @pytest.fixture
 def measured(monkeypatch):
     """Every query's inlined size and widest node, as it's written."""
@@ -65,12 +49,7 @@ def measured(monkeypatch):
     original = sql.query
 
     def query(root, saved=None, **kwargs):
-        known = saved or {}
-        if _summed_cotangent(root, known):
-            # A known finding (#23): look past it by counting the cotangent as the
-            # table it should be saved as.
-            known = {**known, root.inputs[1].id: g.Table(root.inputs[1].shape, torch.float64)}
-        seen.append(inlined_size(root, known))
+        seen.append(inlined_size(root, saved or {}))
         return original(root, saved, **kwargs)
 
     monkeypatch.setattr(sql, "query", query)
@@ -96,18 +75,13 @@ def test_no_query_passes_the_budget(measured, program, budget):
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(
-    strict=True, reason="#23: a cut point's cotangents are summed inside its VJP query"
-)
-def test_a_cotangent_of_many_parts_stays_within_the_budget(measured, monkeypatch):
-    """A cut point read by k later segments gets k cotangent tables, and
-    ``program.total`` sums them inside the cut point's vector-Jacobian
-    product, as a UNION ALL and a GROUP BY, rather than saving the sum. So
-    that query grows with k, past the budget: here, a value read by six
-    others at budget 3 gives a query of 12 SELECTs. A leaf's gradient of
-    many parts is saved first ("saved once, rather than summed again by
-    every reader"); a cotangent could be too."""
-    monkeypatch.setenv("TORCH_SQL_FUZZ_KNOWN", "0")
+def test_a_cotangent_of_many_parts_stays_within_the_budget(measured):
+    """A cut point read by k later segments gets k cotangent tables. When
+    ``program.total`` summed them inside the cut point's vector-Jacobian
+    product, as a UNION ALL and a GROUP BY, that query grew with k, past
+    the budget: here, a value read by six others at budget 3 gave a query
+    of 12 SELECTs. The sum is now saved first, as a leaf's gradient of many
+    parts is (issue #23)."""
     budget = 3
     with torch_sql.Environment(make_engine("datafusion", budget)):
         x = torch.tensor([1.0, 2.0], dtype=torch.float64).to("sql").requires_grad_()

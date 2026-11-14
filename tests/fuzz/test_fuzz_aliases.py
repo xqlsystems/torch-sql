@@ -282,22 +282,16 @@ def test_assigning_data(engine, how):
         torch.testing.assert_close(a, b)
 
 
-# -- Pinned findings ---------------------------------------------------------
-# Each is a strict xfail: it passes once the bug is fixed, then fails until
-# the marker goes.
-
-
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="#21: an alias's history is decided when it's taken")
 @pytest.mark.parametrize("engine", sorted(engines.ENGINES))
 @pytest.mark.parametrize("no_grad", [False, True])
 def test_alias_taken_before_its_base_had_history(engine, no_grad):
     """``d = y.detach()`` is taken while ``y`` has no ``grad_fn``; then a
     tracked ``y.add_(w)`` gives ``y`` one. A write through ``d`` now changes
-    ``y``'s value without autograd recording it, which #18 refuses. But
-    ``Lineage.history`` was decided when ``d`` was taken, so the write is
-    allowed, cuts ``y`` from its history, and ``w.grad`` is 0 where PyTorch
-    gives 1."""
+    ``y``'s value without autograd recording it, which #18 refuses. When
+    ``Lineage.history``, decided when ``d`` was taken, was the only check,
+    the write was allowed, cut ``y`` from its history, and ``w.grad`` was 0
+    where PyTorch gives 1 (issue #21)."""
 
     def program(device):
         w = torch.tensor([1.0, 2.0, 3.0], dtype=F64)
