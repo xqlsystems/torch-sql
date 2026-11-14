@@ -8,6 +8,8 @@ parameters after every step, on every engine and every cut budget.
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 from harness import make_engine, refusals_are_skips
@@ -97,16 +99,23 @@ def test_adam_amsgrad_foreach(engine):
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="#27: vector_norm of one element calls aten.flatten")
 @pytest.mark.parametrize("engine", sorted(engines.ENGINES))
 def test_clipping_a_one_element_gradient(engine):
     """``clip_grad_norm_`` takes the norm of each gradient. PyTorch's
     reference ``vector_norm`` of a one-element tensor calls
-    ``aten.flatten.using_ints``, which torch-sql has no lowering for, so a
-    model with a one-element parameter (``Linear(n, 1)``'s bias) can't clip.
-    The property above treats that refusal as a skip."""
+    ``aten.flatten.using_ints``, which had no lowering (#27), so a model
+    with a one-element parameter (``Linear(n, 1)``'s bias) couldn't clip.
+    The property above treats that refusal as a skip, so this pins it."""
+    torch.manual_seed(0)
+    cpu = torch.nn.Linear(2, 1).double()
+    x = torch.randn(3, 2, dtype=F64)
     with torch_sql.Environment(make_engine(engine)):
-        torch.manual_seed(0)
-        model = torch.nn.Linear(2, 1).double().to("sql")
-        model(torch.randn(3, 2, dtype=F64).to("sql")).sum().backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        dev = copy.deepcopy(cpu).to("sql")
+        dev(x.to("sql")).sum().backward()
+        norm = torch.nn.utils.clip_grad_norm_(dev.parameters(), 0.5)
+        got = [p.grad.cpu() for p in dev.parameters()]
+    cpu(x).sum().backward()
+    want_norm = torch.nn.utils.clip_grad_norm_(cpu.parameters(), 0.5)
+    torch.testing.assert_close(norm.cpu(), want_norm)
+    for g, p in zip(got, cpu.parameters(), strict=True):
+        torch.testing.assert_close(g, p.grad)
