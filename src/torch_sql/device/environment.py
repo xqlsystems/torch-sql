@@ -649,6 +649,15 @@ def _foreach(env: Environment, func, args, kwargs):
         if assign:  # autograd records each element's write apart
             targets[i].reads(call_args, call_kwargs)
     if assign:
+        storages = {id(target.tensor._storage) for target in targets}
+        if len(storages) < len(targets):
+            # PyTorch writes the elements one after another, so a later one
+            # reads what an earlier one wrote, and autograd records some
+            # writes and not others. torch-sql computes every result first.
+            raise NotImplementedError(
+                f"{func} with two destinations that share storage (a tensor and its "
+                ".detach(), say), which torch-sql doesn't support (design §8.6)"
+            )
         for target, result in zip(targets, results, strict=True):
             target.write(result._node)
     return None if not schema.returns else results

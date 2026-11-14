@@ -596,3 +596,14 @@ def test_a_failed_write_gives_no_history(env):
     with torch.no_grad():
         d.add_(1)
     assert y.cpu().tolist() == [1.0, 1.0, 1.0]
+
+
+def test_foreach_write_to_two_aliases_is_refused(env):
+    # Written as one value by PyTorch's elements in turn, with one write
+    # recorded and the other not; torch-sql would lose w's gradient.
+    y = torch.zeros(3, dtype=F64).to("sql")
+    w = torch.ones(3, dtype=F64).to("sql").requires_grad_()
+    c = torch.full((3,), 5.0, dtype=F64).to("sql")
+    with pytest.raises(NotImplementedError, match="share storage"):
+        torch._foreach_maximum_([y, y.detach()], [w, c])
+    assert y.cpu().tolist() == [0.0, 0.0, 0.0]
