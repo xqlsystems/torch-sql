@@ -47,10 +47,14 @@ class Storage:
     """What a tensor and its aliases share: the owner's current node, and
     the table that holds its value once ``torch_sql.sync()`` has run it."""
 
-    __slots__ = ("node", "table", "__weakref__")
+    __slots__ = ("node", "table", "history", "__weakref__")
 
     def __init__(self, node: g.Node):
         self.node, self.table = node, None
+        #: Whether a write that autograd recorded has given a tensor holding
+        #: these values a history (a ``grad_fn``), which an alias taken
+        #: before the write can't know from its lineage.
+        self.history = False
 
 
 class Lineage:

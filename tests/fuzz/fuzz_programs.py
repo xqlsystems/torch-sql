@@ -80,9 +80,11 @@ class Screens:
 
 
 def _real(*xs) -> bool:
-    """Whether the screens can look at values: not while drawing, when the
-    interpreter runs on ``meta`` tensors to infer shapes."""
-    return not any(isinstance(x, torch.Tensor) and x.device.type == "meta" for x in xs)
+    """Whether the screens can look at values: only on the CPU. Not while
+    drawing, when the interpreter runs on ``meta`` tensors to infer shapes,
+    nor on the device, where a screen's boolean mask (``x[isfinite(x)]``)
+    has a data-dependent shape, which torch-sql refuses."""
+    return all(x.device.type == "cpu" for x in xs if isinstance(x, torch.Tensor))
 
 
 def _tie(a: torch.Tensor, b) -> bool:
