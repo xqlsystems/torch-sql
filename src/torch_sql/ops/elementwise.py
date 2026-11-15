@@ -275,9 +275,38 @@ def sigmoid(ctx, x):
     def fn(v):
         positive = g.call(">=", v, zero)
         e = g.call("exp", case(positive, negate(v, ctx.out.dtype), v))
+        if ctx.out.dtype == torch.float32:
+            # Rounded, as PyTorch's float32 kernel: 1 + e is then exactly 1
+            # above about 16.6, so sigmoid saturates where PyTorch's does.
+            # An engine computes exp in DOUBLE.
+            e = g.call("cast:REAL", e)
         return case(positive, one / (one + e), e / (one + e))
 
-    return unary(ctx, x, fn)
+    out = unary(ctx, x, fn)
+    if ctx.out.dtype != torch.float32:
+        return out
+    return _with_slope(ctx, x, out, lambda s: s * (one - s))
+
+
+def _with_slope(ctx, x, out, slope):
+    """``out``, whose gradient is ``slope(out)``, computed from ``out`` as
+    rounded, as PyTorch's float32 backward computes it: ``out`` plus ``(x -
+    x.detach())`` times the detached slope, which is 0. ddx would compute
+    the derivative from ``x`` in DOUBLE. Where ``out`` rounds to exactly 1,
+    ``sigmoid``'s is about 2e-9 at 20 where PyTorch's ``out * (1 - out)`` is
+    0, and ``binary_cross_entropy``'s backward, which divides by ``max(p * (1
+    - p), 1e-12)``, made that into a gradient of 1,443. An infinite ``x``
+    takes the slope as 0, rather than ``inf - inf``."""
+    shape, dtype = out_of(ctx)
+    stop = lambda n: g.identity(n, stop_gradient=True)  # noqa: E731
+    k = elementwise(shape, dtype, [out], slope)
+    zero = scalar(0.0, dtype)
+
+    def fn(o, v, v0, k):
+        dv = v - v0
+        return o + case(g.call("isnan", dv), zero, dv) * k
+
+    return elementwise(shape, dtype, [stop(out), x, stop(x), stop(k)], fn)
 
 
 @op(aten.abs.default)

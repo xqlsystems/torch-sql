@@ -692,6 +692,22 @@ EXTREMES = {
         [-50.0, 0.5, 2.0],
         F64,
     ),
+    # In float32, sigmoid rounds to 1 above about 16.6, where PyTorch's
+    # gradient of it, out * (1 - out), is 0. ddx's, from x in DOUBLE,
+    # wasn't, and binary_cross_entropy's 1 / 1e-12 made it 1,443 at 20.
+    "bce-float32-saturated": (
+        lambda x: F.binary_cross_entropy(
+            torch.sigmoid(x), torch.full_like(x, 0.3), reduction="sum"
+        ),
+        [17.0, 20.0, 30.0, 15.0, -20.0, 0.5],
+        torch.float32,
+    ),
+    "sigmoid-float32-saturated": (
+        lambda x: torch.sigmoid(x).sum(),
+        [float("inf"), float("-inf"), 3.0, 17.0],
+        torch.float32,
+    ),
+    "silu-float32": (lambda x: F.silu(x).sum(), [-100.0, 100.0, -3.0, 17.0], torch.float32),
     "bce-float32": (
         lambda x: F.binary_cross_entropy(torch.sigmoid(x), torch.ones_like(x)),
         [-20.0, 0.5, 3.0],
@@ -742,13 +758,23 @@ def test_zero_initialized_classifier_head(env):
     close(sql_head.weight.grad, head.weight.grad)
 
 
-def test_float32_gradient_past_its_range(env, request):
-    # 1e-30 is a normal float32, and 1/x's gradient there, -1e60, rounds to
-    # -inf. On DuckDB, ddx casts its DOUBLE gradient to REAL, which raises.
+@pytest.mark.parametrize(
+    "loss, values",
+    [
+        # 1e-30 is a normal float32, and 1/x's gradient there, -1e60,
+        # rounds to -inf.
+        (lambda x: x.reciprocal().sum(), [1e-30, 1.0]),
+        # exp(89) overflows float32, and so does its gradient.
+        (lambda x: x.exp().sum(), [89.0, 1.0]),
+    ],
+    ids=["reciprocal", "exp"],
+)
+def test_float32_gradient_past_its_range(env, request, loss, values):
+    # On DuckDB, ddx casts its DOUBLE gradient to REAL, which raises.
     if "duckdb" in request.node.callspec.id:
         request.applymarker(pytest.mark.xfail(strict=True, reason="xqlsystems/ddx#272"))
-    x = torch.tensor([1e-30, 1.0], requires_grad=True)
-    x.reciprocal().sum().backward()
+    x = torch.tensor(values, requires_grad=True)
+    loss(x).backward()
     s = x.detach().to("sql").requires_grad_()
-    s.reciprocal().sum().backward()
+    loss(s).backward()
     torch.testing.assert_close(s.grad.cpu(), x.grad)
