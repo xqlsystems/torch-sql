@@ -232,31 +232,30 @@ def real(e: Expr) -> Expr:
     """``e``, which may be DOUBLE, cast to REAL. DuckDB raises on a DOUBLE
     past REAL's range, where IEEE rounding, DataFusion and PyTorch give an
     infinity, so such a value is rounded to one first. Below that, DuckDB's
-    cast rounds as IEEE does."""
+    cast rounds as IEEE does.
+
+    The infinity is added to ``e`` rather than put in its place, so that
+    ``e``'s gradient passes through unchanged, as PyTorch's does through a
+    rounding to infinity: a constant in its place had a gradient of 0, which
+    reached every element of a sum that overflowed. A NaN compares false and
+    adds 0."""
     big = Lit(_REAL_OVERFLOW, torch.float64)
-    rounded = Call(
+    offset = Call(
         "case",
         (
-            Call("isnan", (e,)),
-            e,
+            Call(">=", (e, big)),
+            Lit(math.inf, torch.float64),
             Call(
                 "case",
                 (
-                    Call(">=", (e, big)),
-                    Lit(math.inf, torch.float64),
-                    Call(
-                        "case",
-                        (
-                            Call("<=", (e, Lit(-_REAL_OVERFLOW, torch.float64))),
-                            Lit(-math.inf, torch.float64),
-                            e,
-                        ),
-                    ),
+                    Call("<=", (e, Lit(-_REAL_OVERFLOW, torch.float64))),
+                    Lit(-math.inf, torch.float64),
+                    Lit(0.0, torch.float64),
                 ),
             ),
         ),
     )
-    return Call("cast:REAL", (rounded,))
+    return Call("cast:REAL", (Call("+", (e, offset)),))
 
 
 def _may_be_double(e: Expr, node: Select) -> bool:

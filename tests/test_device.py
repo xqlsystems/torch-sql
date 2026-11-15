@@ -919,3 +919,35 @@ def test_new_tensor(env):
     t = x.new_tensor([1.0, 2.0])
     assert isinstance(t, torch_sql.Tensor) and t.dtype == F64
     same(t, torch.tensor([1.0, 2.0], dtype=F64))
+
+
+# -- Found by CodeRabbit's review of #29 -------------------------------------
+
+
+def test_norm_refuses_a_narrowing_dtype(env):
+    x = torch.tensor([3.0, 4.0], dtype=F64)
+    with pytest.raises(RuntimeError, match="dtype"):
+        torch.linalg.vector_norm(x.to("sql"), dtype=torch.float32)
+
+
+def test_float32_std_is_computed_wide(env):
+    # The variance of [-1e20, 1e20] passes float32's range; PyTorch
+    # accumulates it in float64, so the standard deviation doesn't.
+    x = torch.tensor([-1e20, 1e20])
+    for fn in (lambda t: torch.std(t, correction=0), lambda t: torch.std_mean(t, correction=0)[0]):
+        got = fn(x.to("sql"))
+        assert got.dtype == torch.float32
+        torch.testing.assert_close(got.cpu(), fn(x))
+    same(torch.var(x.to("sql"), correction=0), torch.var(x, correction=0))
+
+
+def test_new_tensor_devices_and_data(env):
+    s = torch.ones(2, dtype=F64, device="sql")
+    # A torch-sql tensor as data, copied.
+    same(s.new_tensor(s), torch.ones(2, dtype=F64))
+    # A CPU receiver keeps the CPU, whatever the data.
+    t = torch.ones(1).new_tensor(s)
+    assert t.device.type == "cpu" and t.dtype == torch.float32
+    # requires_grad, on either device.
+    assert s.new_tensor([1.0], device="cpu", requires_grad=True).requires_grad
+    assert s.new_tensor([1.0], requires_grad=True).requires_grad

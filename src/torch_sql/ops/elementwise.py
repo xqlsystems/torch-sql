@@ -215,10 +215,13 @@ def log(ctx, x):
     # ln(0) is -inf and ln(x < 0) is NaN, as in PyTorch; DuckDB raises on
     # both. A NaN takes the first branch on DuckDB and the last on
     # DataFusion if its sign bit is set; either way the result is NaN, so
-    # this needs no isnan. sqrt and rsqrt are the same.
+    # this needs no isnan. sqrt and rsqrt are the same. At 0 the value is
+    # -inf * (1 - v), which is -inf with a gradient of +inf, PyTorch's 1/0;
+    # a constant -inf would have a gradient of 0.
     def fn(v):
-        zero = scalar(0.0, ctx.out.dtype)
-        return case(g.call(">", v, zero), g.call("ln", v), case(g.call("=", v, zero), NEG_INF, NAN))
+        zero, one = scalar(0.0, ctx.out.dtype), scalar(1.0, ctx.out.dtype)
+        at_zero = NEG_INF * (one - v)
+        return case(g.call(">", v, zero), g.call("ln", v), case(g.call("=", v, zero), at_zero, NAN))
 
     return unary(ctx, x, fn)
 
@@ -263,8 +266,18 @@ def tanh(ctx, x):
 
 @op(aten.sigmoid.default)
 def sigmoid(ctx, x):
-    one = scalar(1.0, ctx.out.dtype)
-    return unary(ctx, x, lambda v: one / (one + g.call("exp", negate(v, ctx.out.dtype))))
+    """``1 / (1 + e)`` for ``v >= 0`` and ``e / (1 + e)`` below, with ``e =
+    exp(-|v|)``, as PyTorch computes it. ``e`` is at most 1, so neither
+    branch's gradient overflows: ``1 / (1 + exp(-v))`` alone has a gradient
+    of inf / inf, NaN, below about -709 (issue #35)."""
+    one, zero = scalar(1.0, ctx.out.dtype), scalar(0.0, ctx.out.dtype)
+
+    def fn(v):
+        positive = g.call(">=", v, zero)
+        e = g.call("exp", case(positive, negate(v, ctx.out.dtype), v))
+        return case(positive, one / (one + e), e / (one + e))
+
+    return unary(ctx, x, fn)
 
 
 @op(aten.abs.default)
@@ -384,11 +397,13 @@ def clamp(ctx, x, min=None, max=None):
         lo = bounds.pop(0) if min is not None else None
         hi = bounds.pop(0) if max is not None else None
         # min(max(v, lo), hi), as PyTorch computes it: hi wins when lo > hi.
+        # At a bound the value is the bound's, which gets the gradient, as
+        # PyTorch's clamp gives v none there.
         out = v
         if lo is not None:
-            out = case(g.call("<", out, lo), lo, out)
+            out = case(g.call("<=", out, lo), lo, out)
         if hi is not None:
-            out = case(g.call(">", out, hi), hi, out)
+            out = case(g.call(">=", out, hi), hi, out)
         if dt in FLOATS:
             nan = any_of(isnan(v), *(isnan(b) for b in (lo, hi) if b is not None))
             out = case(nan, NAN, out)

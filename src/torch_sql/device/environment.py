@@ -292,6 +292,10 @@ class Environment:
         if lowering is None:
             decomposition = DECOMPOSITIONS.get(func)
             if decomposition is not None:
+                if func in OWN_DECOMPOSITIONS:
+                    # PyTorch's checks of the call: a norm's dtype that
+                    # narrows its input, a dimension out of range.
+                    self._meta(func, args, kwargs)
                 # It calls simpler ops, which come back here. Some create
                 # tensors on the input's device, sql to Python code and meta
                 # to C++; _Factories makes those torch-sql tensors.
