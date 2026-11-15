@@ -280,7 +280,10 @@ class Environment:
                 "nonzero), which torch-sql can't plan; torch.where(mask, x, 0.0) or "
                 "x.masked_fill(~mask, 0.0) keep x's shape"
             )
-        _check_devices(func, args, kwargs)
+        if not func._schema.name.startswith("aten::_foreach_"):
+            # A _foreach_ op reads a CPU tensor of scalars one by one; each
+            # element's op is checked as it's dispatched.
+            _check_devices(func, args, kwargs)
         if func._schema.name.startswith("aten::_foreach_"):
             return _foreach(self, func, args, kwargs)
         if func._schema.is_mutable:

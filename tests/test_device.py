@@ -787,3 +787,40 @@ def test_to_with_keywords_in_nested_environments(env):
     with torch_sql.Environment("duckdb" if env.engine.name != "duckdb" else "datafusion") as inner:
         t = torch.ones(2, dtype=F64).to(dtype=F64, device=torch.device("sql"))
         assert t._env is inner
+
+
+def test_float32_past_its_range_is_infinite(env):
+    # DuckDB computes a float32 sum or exp in DOUBLE, and raises on casting
+    # one past REAL's range, where PyTorch gives an infinity.
+    x = torch.tensor([3e38, 3e38])
+    same(x.to("sql").sum(), x.sum())
+    same((-x).to("sql").sum(), (-x).sum())
+    y = torch.tensor([100.0, 1.0, float("nan")])
+    same(y.to("sql").exp(), y.exp())
+
+
+def test_var_of_a_scalar_along_a_dimension(env):
+    x = torch.tensor(2.0, dtype=F64)
+    for dim in (0, -1):
+        same(torch.var(x.to("sql"), dim=dim, correction=0), torch.var(x, dim=dim, correction=0))
+
+
+def test_foreach_with_a_cpu_tensor_of_scalars(env):
+    p = [torch.zeros(2, dtype=F64, device="sql")]
+    a = [torch.ones(2, dtype=F64, device="sql")]
+    torch._foreach_addcmul_(p, a, a, torch.tensor([2.0], dtype=F64))
+    same(p[0], torch.full((2,), 2.0, dtype=F64))
+
+
+def test_cosine_similarity_of_integers_and_of_large_vectors(env):
+    f = torch.nn.functional.cosine_similarity
+    i, x = torch.tensor([3, 4]), torch.tensor([3.0, 4.0], dtype=F64)
+    same(f(i.to("sql"), x.to("sql"), dim=0), f(i, x, dim=0))
+    big, one = torch.tensor([[1e20, 1e20]]), torch.tensor([[1.0, 1.0]])
+    same(f(big.to("sql"), one.to("sql")), f(big, one))
+    # Below eps, the clamp changes the norm's value but not its gradient.
+    small = torch.tensor([[1e-10, 0.0]], dtype=F64, requires_grad=True)
+    f(small, x[None]).sum().backward()
+    s = small.detach().to("sql").requires_grad_()
+    f(s, x[None].to("sql")).sum().backward()
+    torch.testing.assert_close(s.grad.cpu(), small.grad)

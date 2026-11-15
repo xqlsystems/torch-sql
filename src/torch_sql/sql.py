@@ -165,7 +165,10 @@ def cast_to(e: Expr, dtype: torch.dtype) -> Call:
 
 def select(node: Select, resolve=lambda n: n) -> str:
     aliases = [f"t{k}" for k in range(len(node.inputs))]
-    nonfinite = any(_nonfinite(sub) for e in node.expressions() for sub in walk(e))
+    value = node.value
+    if node.dtype == torch.float32 and not _reads_real(node):
+        value = _to_real(value, node)
+    nonfinite = any(_nonfinite(sub) for e in (*node.expressions(), value) for sub in walk(e))
     ieee = "tieee" if nonfinite else None
     # Attach each equality to the latest input it reads, so that every input
     # joins on the ones before it; an input no equality reaches is a cross
@@ -192,13 +195,7 @@ def select(node: Select, resolve=lambda n: n) -> str:
         f"{expr(e, aliases, ieee, grouped)} AS {c}"
         for e, c in zip(node.index, node.columns, strict=True)
     ]
-    value = expr(node.value, aliases, ieee, grouped)
-    if node.dtype == torch.float32 and not _reads_real(node):
-        # Each float32 op rounds its result to float32, as PyTorch's do. An
-        # engine computes some of it in DOUBLE: SUM and AVG of REAL, and
-        # DuckDB's exp, ln and tanh.
-        value = f"CAST({value} AS REAL)"
-    cols.append(f"{value} AS v")
+    cols.append(f"{expr(value, aliases, ieee, grouped)} AS v")
     sql = f"SELECT {', '.join(cols)}"
     if parts:
         sql += f" FROM {' '.join(parts)}"
@@ -210,6 +207,61 @@ def select(node: Select, resolve=lambda n: n) -> str:
     if node.group and keys:
         sql += f" GROUP BY {', '.join(keys)}"
     return sql
+
+
+#: The least DOUBLE that rounds to float32's infinity: halfway between
+#: float32's largest finite value and 2**128.
+_REAL_OVERFLOW = 3.4028235677973366e38
+
+
+def _to_real(e: Expr, node: Select) -> Expr:
+    """``e`` cast to REAL. Each float32 op rounds its result to float32, as
+    PyTorch's do; an engine computes some of it in DOUBLE (SUM and AVG of
+    REAL, and DuckDB's exp, ln and tanh). DuckDB raises on a DOUBLE past
+    REAL's range, where IEEE rounding, DataFusion and PyTorch give an
+    infinity, so a value that may be DOUBLE is rounded to one first."""
+    if not _may_be_double(e, node):
+        return Call("cast:REAL", (e,))
+    big = Lit(_REAL_OVERFLOW, torch.float64)
+    rounded = Call(
+        "case",
+        (
+            Call("isnan", (e,)),
+            e,
+            Call(
+                "case",
+                (
+                    Call(">=", (e, big)),
+                    Lit(math.inf, torch.float64),
+                    Call(
+                        "case",
+                        (
+                            Call("<=", (e, Lit(-_REAL_OVERFLOW, torch.float64))),
+                            Lit(-math.inf, torch.float64),
+                            e,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return Call("cast:REAL", (rounded,))
+
+
+def _may_be_double(e: Expr, node: Select) -> bool:
+    """Whether an engine may compute ``e`` in DOUBLE: it reads a float64
+    column or constant, or applies a function or an aggregate. Arithmetic of
+    REAL stays REAL, and overflows to an infinity, on both engines."""
+    for sub in walk(e):
+        if isinstance(sub, Agg) or (isinstance(sub, Call) and sub.fn in FUNCTIONS):
+            return True
+        if isinstance(sub, Lit) and sub.dtype == torch.float64:
+            return True
+        if isinstance(sub, Col) and node.inputs[sub.input].dtype == torch.float64:
+            return True
+        if isinstance(sub, Call) and sub.fn.startswith("cast:") and sub.fn != "cast:REAL":
+            return True
+    return False
 
 
 def _reads_real(node: Select) -> bool:

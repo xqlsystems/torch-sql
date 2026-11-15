@@ -102,11 +102,17 @@ def cosine_similarity(x1, x2, dim=1, eps=1e-8):
     under ``NoGradGuard``: the clamp changes their values, not their
     gradients. torch-sql refuses such a write (issue #18), so the clamp here
     is a stop-gradient difference, with the same value and gradient."""
-    x1, x2 = torch.broadcast_tensors(x1, x2)
+    dtype = torch.result_type(x1, x2)
+    if not dtype.is_floating_point:  # PyTorch's norm takes only floats
+        dtype = torch.get_default_dtype()
+    x1, x2 = torch.broadcast_tensors(x1.to(dtype), x2.to(dtype))
     norms = []
     for x in (x1, x2):
         norm = torch.linalg.vector_norm(x, 2, dim=dim, keepdim=True)
-        norms.append(norm + (norm.clamp_min(eps) - norm).detach())
+        # Only where the clamp changes the norm: an infinite norm, of a
+        # vector whose squares overflow, would otherwise be inf - inf.
+        clamped = norm + (norm.clamp_min(eps) - norm).detach()
+        norms.append(torch.where(norm < eps, clamped, norm))
     return ((x1 / norms[0]) * (x2 / norms[1])).sum(dim)
 
 

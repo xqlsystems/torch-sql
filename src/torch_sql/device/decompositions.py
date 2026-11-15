@@ -23,7 +23,8 @@ def var(x, dim=None, *, correction=None, keepdim=False):
         dims = list(range(x.dim()))
     else:
         dims = [dim] if isinstance(dim, int) else list(dim)
-    n = math.prod(x.shape[d] for d in dims)
+    # A 0-d tensor reduces along dimension 0 or -1, of size 1.
+    n = math.prod(x.shape[d] for d in dims) if x.dim() else 1
     correction = 1 if correction is None else correction
     deviation = x - x.mean(dims, keepdim=True)
     return (deviation * deviation).sum(dims, keepdim=keepdim) / max(n - correction, 0)
