@@ -365,6 +365,12 @@ DIFFERENTIABLE = [
     "max",
     "min",
     "unbind",
+    "log1p",
+    "var",
+    "std",
+    "where",
+    "nn.functional.cosine_similarity",
+    "nn.functional.binary_cross_entropy_with_logits",
 ]
 
 

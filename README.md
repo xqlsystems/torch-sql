@@ -50,3 +50,7 @@ with torch_sql.Environment("duckdb"):
     y = mlp(torch.randn(4, 3, dtype=torch.float64, device="sql"))
     print(y)  # runs one SQL query on DuckDB
 ```
+
+torch-sql supports float64, int64 and bool tensors so far, and PyTorch's
+default dtype is float32, so call `torch.set_default_dtype(torch.float64)`
+first, or `.double()` on the model and its inputs as above.

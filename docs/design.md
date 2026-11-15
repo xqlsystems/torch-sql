@@ -672,6 +672,13 @@ parameter, which xarray-sql then registers. This gives the structure of a
 model from running its code, and its weights from data, with no `torch.export`
 step (decision D1). Where the extension lives is open (§17).
 
+Until then, a checkpoint goes through the CPU. `torch.save` pickles a
+torch-sql tensor as its value on the CPU, since a table lives only as long as
+its environment and its engine. So a saved `state_dict`, a model's or an
+optimizer's, is an ordinary PyTorch checkpoint. `load_state_dict` copies the
+values back into a model's tensors on `sql`, and an optimizer's moves its state
+to its parameters' device.
+
 ### 7.3 Changes to Samudra
 
 The goal is very few changes to how the model is written. The co-processor

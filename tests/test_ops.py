@@ -98,6 +98,15 @@ OPS = [
     "max",
     "min",
     "unbind",
+    "log1p",
+    "isinf",
+    "isfinite",
+    "nan_to_num",
+    "var",
+    "std",
+    "where",
+    "nn.functional.cosine_similarity",
+    "nn.functional.binary_cross_entropy_with_logits",
 ]
 
 #: (op, why) for samples torch-sql refuses on purpose. Each refusal raises

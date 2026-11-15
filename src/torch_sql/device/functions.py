@@ -56,6 +56,12 @@ def getitem(x, index):
     makes it a torch-sql tensor first."""
 
     def convert(i):
+        if isinstance(i, torch.Tensor) and i.dtype in (torch.bool, torch.uint8) and i.dim() > 0:
+            raise NotImplementedError(
+                "x[mask], with a boolean mask, has a shape that depends on mask's values, which "
+                "torch-sql can't plan; torch.where(mask, x, 0.0) or x.masked_fill(~mask, 0.0) "
+                "keep x's shape"
+            )
         if isinstance(i, list) or (
             isinstance(i, torch.Tensor) and i.device.type == "cpu" and i.dim() > 0
         ):
@@ -66,8 +72,50 @@ def getitem(x, index):
     return torch.Tensor.__getitem__(x, index)
 
 
+def where(condition, input=None, other=None, **kwargs):
+    """``torch.where(condition, x, 0.0)``. PyTorch wraps a number branch in a
+    tensor on ``x``'s device, in C++, which would be a plain meta tensor;
+    torch-sql makes it a torch-sql tensor first, in the dtype PyTorch
+    gives it."""
+    if input is None or other is None or kwargs:
+        return torch.where(condition, *(a for a in (input, other) if a is not None), **kwargs)
+    env = next(a._env for a in (condition, input, other) if hasattr(a, "_env"))
+    branches = [input, other]
+    for k, branch in enumerate(branches):
+        if not isinstance(branch, torch.Tensor):
+            peer = branches[1 - k]
+            dtype = torch.result_type(
+                peer if isinstance(peer, torch.Tensor) else torch.tensor(peer), branch
+            )
+            branches[k] = env.tensor(torch.tensor(branch, dtype=dtype))
+    return torch.where(condition, *branches)
+
+
+def tensor_where(self, condition, other):
+    """``x.where(condition, other)``, which is ``torch.where(condition, x,
+    other)``."""
+    return where(condition, self, other)
+
+
+def cosine_similarity(x1, x2, dim=1, eps=1e-8):
+    """PyTorch's C++ form (``Distance.cpp``), which clamps the norms in place
+    under ``NoGradGuard``: the clamp changes their values, not their
+    gradients. torch-sql refuses such a write (issue #18), so the clamp here
+    is a stop-gradient difference, with the same value and gradient."""
+    x1, x2 = torch.broadcast_tensors(x1, x2)
+    norms = []
+    for x in (x1, x2):
+        norm = torch.linalg.vector_norm(x, 2, dim=dim, keepdim=True)
+        norms.append(norm + (norm.clamp_min(eps) - norm).detach())
+    return ((x1 / norms[0]) * (x2 / norms[1])).sum(dim)
+
+
 #: The functions, by the PyTorch function they replace.
 FUNCTIONS = {
     F.scaled_dot_product_attention: scaled_dot_product_attention,
     torch.Tensor.__getitem__: getitem,
+    torch.where: where,
+    torch.Tensor.where: tensor_where,
+    F.cosine_similarity: cosine_similarity,
+    torch.cosine_similarity: cosine_similarity,
 }

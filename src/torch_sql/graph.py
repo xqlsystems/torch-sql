@@ -54,9 +54,15 @@ def index_columns(rank: int) -> tuple[str, ...]:
 
 def check_dtype(dtype: torch.dtype) -> None:
     if dtype not in SQL_TYPES:
+        hint = ""
+        if dtype == torch.float32:
+            hint = (
+                ". PyTorch's default dtype is float32: call torch.set_default_dtype("
+                "torch.float64) first, or .double() on the model and its inputs"
+            )
         raise NotImplementedError(
             f"torch-sql doesn't support {dtype} yet; it supports "
-            f"{', '.join(str(d) for d in SQL_TYPES)} (design §8.2)"
+            f"{', '.join(str(d) for d in SQL_TYPES)} (design §8.2){hint}"
         )
 
 

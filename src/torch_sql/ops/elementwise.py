@@ -35,6 +35,7 @@ FLOATS = (torch.float64,)
 
 NAN = g.Lit(math.nan, torch.float64)
 NEG_INF = g.Lit(-math.inf, torch.float64)
+INF = g.Lit(math.inf, torch.float64)
 
 
 def out_of(ctx: Context):
@@ -224,6 +225,26 @@ def log(ctx, x):
     return unary(ctx, x, fn)
 
 
+@op(aten.log1p.default)
+def log1p(ctx, x):
+    """``ln(1 + v)``, without losing ``v``'s digits when it's small, which
+    ``ln(1 + v)`` itself does. For ``|v| < 1``, ``v * ln(u) / (u - 1)``,
+    with ``u = 1 + v`` as rounded (Theorem 4 of Goldberg's "What every
+    computer scientist should know about floating-point arithmetic"); its
+    derivative loses digits for large ``v``, where ``ln(u)`` is accurate.
+    No engine has ``log1p``. The binary cross-entropy losses and
+    ``softplus`` call it."""
+
+    def fn(v):
+        one, zero = scalar(1.0, ctx.out.dtype), scalar(0.0, ctx.out.dtype)
+        u = one + v
+        small = case(g.call("=", u, one), v, v * g.call("ln", u) / (u - one))
+        ln = case(g.call(">", u, zero), g.call("ln", u), case(g.call("=", u, zero), NEG_INF, NAN))
+        return case(g.call("<", g.call("abs", v), one), small, ln)
+
+    return unary(ctx, x, fn)
+
+
 @op(aten.sqrt.default)
 def sqrt(ctx, x):
     return unary(
@@ -394,6 +415,23 @@ def isnan_(ctx, x):
         return unary(ctx, x, lambda v: g.Lit(False, torch.bool))
     return elementwise(
         ctx.out.shape, torch.bool, [x], lambda v: g.call("isnan", v), compute=x.dtype
+    )
+
+
+@op(aten.isinf.default)
+def isinf(ctx, x):
+    """``isfinite`` decomposes into this and ``isnan``; ``clip_grad_norm_``
+    with ``error_if_nonfinite=True`` reads it."""
+    if x.dtype not in FLOATS:
+        return unary(ctx, x, lambda v: g.Lit(False, torch.bool))
+    return elementwise(
+        ctx.out.shape,
+        torch.bool,
+        [x],
+        lambda v: g.call(
+            "and", g.call("not", g.call("isnan", v)), g.call("=", g.call("abs", v), INF)
+        ),
+        compute=x.dtype,
     )
 
 
