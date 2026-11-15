@@ -852,3 +852,70 @@ def test_the_gradient_of_a_norm_at_zero(env):
         s = a.detach().to("sql").requires_grad_()
         fn(s).backward()
         torch.testing.assert_close(s.grad.cpu(), a.grad, rtol=1e-12, atol=1e-12)
+
+
+# -- Found by the adversary's review of #29 ----------------------------------
+
+
+def test_bool_and_int_to_float32(env):
+    pred, y = torch.tensor([1, 0, 2]), torch.tensor([1, 1, 2])
+    accuracy = (pred.to("sql") == y.to("sql")).float().mean()
+    same(accuracy, (pred == y).float().mean())
+    mask, x = torch.tensor([True, False]), torch.tensor([1.5, 2.5])
+    same(mask.to("sql") * x.to("sql"), mask * x)
+    same(mask.to("sql") + 0.5, mask + 0.5)
+    same(mask.to("sql").sum(dtype=torch.float32), mask.sum(dtype=torch.float32))
+    # Rounded once, as PyTorch does, not through DOUBLE first.
+    big = torch.tensor([2**60 + 2**36 + 1])
+    assert torch.equal(big.to("sql").float().cpu(), big.float())
+
+
+def test_gradient_of_std_where_it_is_zero(env):
+    # A constant feature, normalized: PyTorch's std_backward gives 0 there.
+    x = torch.tensor([[2.0, 1.0], [2.0, 3.0], [2.0, 4.0]], dtype=F64, requires_grad=True)
+    ((x - x.mean(0)) / (x.std(0) + 1e-5)).pow(2).sum().backward()
+    s = x.detach().to("sql").requires_grad_()
+    ((s - s.mean(0)) / (s.std(0) + 1e-5)).pow(2).sum().backward()
+    same(s.grad, x.grad)
+    for fn in (torch.var_mean, torch.std_mean):
+        for got, expected in zip(fn(s.detach(), 0), fn(x.detach(), 0), strict=True):
+            same(got, expected)
+
+
+def test_a_checkpoint_keeps_requires_grad(env):
+    import io
+
+    saved = io.BytesIO()
+    torch.save({"W": torch.randn(2, 1).to("sql").requires_grad_()}, saved)
+    saved.seek(0)
+    assert torch.load(saved)["W"].requires_grad
+
+
+def test_assigning_through_a_cpu_index(env):
+    # PyTorch on another device accepts a CPU index; the error is the op's.
+    x = torch.zeros(3, dtype=F64, device="sql")
+    with pytest.raises(NotImplementedError, match="index_put"):
+        x[torch.tensor([0, 2])] = 9.0
+    x[x < 1] = 4.0
+    same(x, torch.full((3,), 4.0, dtype=F64))
+
+
+def test_cosine_similarity_dtypes(env):
+    f = torch.nn.functional.cosine_similarity
+    i = torch.tensor([[3, 4]])
+    with pytest.raises(RuntimeError, match="floating point"):
+        f(i.to("sql"), i.to("sql"))
+    a, b = torch.tensor([[1.0, 2.0]]), torch.tensor([[3.0, 1.0]], dtype=F64)
+    same(f(a.to("sql"), b.to("sql")), f(a, b))
+
+
+def test_a_list_of_bools_as_an_index_is_refused_clearly(env):
+    with pytest.raises(NotImplementedError, match="boolean mask"):
+        torch.arange(3, dtype=F64, device="sql")[[True, False, True]]
+
+
+def test_new_tensor(env):
+    x = torch.ones(2, dtype=F64, device="sql")
+    t = x.new_tensor([1.0, 2.0])
+    assert isinstance(t, torch_sql.Tensor) and t.dtype == F64
+    same(t, torch.tensor([1.0, 2.0], dtype=F64))

@@ -54,22 +54,46 @@ def getitem(x, index):
     """``x[index]``. PyTorch turns a list in an index (``x[:, [-1]]``), or a
     CPU tensor, into an index tensor on ``x``'s device, in C++; torch-sql
     makes it a torch-sql tensor first."""
-
-    def convert(i):
-        if isinstance(i, torch.Tensor) and i.dtype in (torch.bool, torch.uint8) and i.dim() > 0:
+    for i in index if isinstance(index, tuple) else (index,):
+        if _is_mask(i):
             raise NotImplementedError(
                 "x[mask], with a boolean mask, has a shape that depends on mask's values, which "
                 "torch-sql can't plan; torch.where(mask, x, 0.0) or x.masked_fill(~mask, 0.0) "
                 "keep x's shape"
             )
+    return torch.Tensor.__getitem__(x, _converted(x, index))
+
+
+def setitem(x, index, value):
+    """``x[index] = value``, with the index converted as for :func:`getitem`.
+    A boolean mask is fine here: ``x[mask] = 0`` keeps ``x``'s shape."""
+    return torch.Tensor.__setitem__(x, _converted(x, index), value)
+
+
+def _is_mask(i) -> bool:
+    if isinstance(i, torch.Tensor):
+        return i.dtype in (torch.bool, torch.uint8) and i.dim() > 0
+    return isinstance(i, list) and bool(i) and all(isinstance(b, bool) for b in i)
+
+
+def _converted(x, index):
+    def convert(i):
         if isinstance(i, list) or (
             isinstance(i, torch.Tensor) and i.device.type == "cpu" and i.dim() > 0
         ):
             return x._env.tensor(torch.as_tensor(i))
         return i
 
-    index = tuple(convert(i) for i in index) if isinstance(index, tuple) else convert(index)
-    return torch.Tensor.__getitem__(x, index)
+    return tuple(convert(i) for i in index) if isinstance(index, tuple) else convert(index)
+
+
+def new_tensor(self, data, dtype=None, device=None, requires_grad=False, **kwargs):
+    """``x.new_tensor(data)``: a tensor of ``data`` on ``x``'s device, which
+    PyTorch's C++ would make on ``meta``."""
+    if device is not None and torch.device(device).type != "sql":
+        return torch.tensor(data, dtype=dtype or self.dtype, device=device)
+    cpu = torch.as_tensor(data, dtype=dtype or self.dtype).detach().clone()
+    return self._env.tensor(cpu).requires_grad_(requires_grad)
 
 
 def where(condition, input=None, other=None, **kwargs):
@@ -103,9 +127,13 @@ def cosine_similarity(x1, x2, dim=1, eps=1e-8):
     gradients. torch-sql refuses such a write (issue #18), so the clamp here
     is a stop-gradient difference, with the same value and gradient."""
     dtype = torch.result_type(x1, x2)
-    if not dtype.is_floating_point:  # PyTorch's norm takes only floats
-        dtype = torch.get_default_dtype()
-    x1, x2 = torch.broadcast_tensors(x1.to(dtype), x2.to(dtype))
+    if not dtype.is_floating_point:
+        raise RuntimeError(
+            f"expected common dtype to be floating point, yet common dtype is {dtype}"
+        )
+    # An integer input is converted; a float keeps its own dtype for its norm.
+    x1, x2 = (x if x.is_floating_point() else x.to(dtype) for x in (x1, x2))
+    x1, x2 = torch.broadcast_tensors(x1, x2)
     norms = []
     for x in (x1, x2):
         norm = torch.linalg.vector_norm(x, 2, dim=dim, keepdim=True)
@@ -120,6 +148,8 @@ def cosine_similarity(x1, x2, dim=1, eps=1e-8):
 FUNCTIONS = {
     F.scaled_dot_product_attention: scaled_dot_product_attention,
     torch.Tensor.__getitem__: getitem,
+    torch.Tensor.__setitem__: setitem,
+    torch.Tensor.new_tensor: new_tensor,
     torch.where: where,
     torch.Tensor.where: tensor_where,
     F.cosine_similarity: cosine_similarity,

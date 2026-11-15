@@ -278,7 +278,7 @@ class Tensor(torch.Tensor):
         tensor can't be saved on ``sql``. ``load_state_dict`` copies the CPU
         values back into the model's torch-sql tensors, and an optimizer's
         moves its state to its parameters' device."""
-        cpu = self.detach().cpu()
+        cpu = self.detach().cpu().requires_grad_(self.requires_grad)
         if getattr(self, "_is_param", False):
             from collections import OrderedDict
 

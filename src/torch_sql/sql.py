@@ -159,8 +159,11 @@ def expr(e: Expr, aliases: list[str], ieee: str | None = None, grouped: bool = F
     raise TypeError(f"not an expression: {e!r}")
 
 
-def cast_to(e: Expr, dtype: torch.dtype) -> Expr:
-    if dtype == torch.float32:
+def cast_to(e: Expr, dtype: torch.dtype, source: torch.dtype | None = None) -> Expr:
+    """``e``, of dtype ``source``, cast to ``dtype``. Only a float64 value
+    can pass float32's range (:func:`real`); a BIGINT or a BOOLEAN casts to
+    REAL directly, rounding as PyTorch does."""
+    if dtype == torch.float32 and source == torch.float64:
         return real(e)
     return Call(f"cast:{SQL_TYPES[dtype]}", (e,))
 

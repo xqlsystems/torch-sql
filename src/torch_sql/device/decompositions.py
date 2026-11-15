@@ -32,6 +32,28 @@ def var(x, dim=None, *, correction=None, keepdim=False):
     return (deviation * deviation).sum(dims, keepdim=keepdim) / max(n - correction, 0)
 
 
+def std(x, dim=None, *, correction=None, keepdim=False):
+    """``aten.std.correction``: ``sqrt(var)``, with a gradient of 0 where
+    the standard deviation is 0, as PyTorch's backward gives, rather than
+    ``sqrt``'s 0/0. A constant feature in ``(x - x.mean(0)) / x.std(0)``
+    would otherwise make every gradient NaN."""
+    v = var(x, dim, correction=correction, keepdim=keepdim)
+    zero = v == 0
+    return v.masked_fill(zero, 1.0).sqrt().masked_fill(zero, 0.0)
+
+
+def var_mean(x, dim=None, *, correction=None, keepdim=False):
+    """``torch.var_mean``: the variance, and the mean it's taken about."""
+    dims = list(range(x.dim())) if dim is None else dim
+    return var(x, dim, correction=correction, keepdim=keepdim), x.mean(dims, keepdim=keepdim)
+
+
+def std_mean(x, dim=None, *, correction=None, keepdim=False):
+    """``torch.std_mean``."""
+    dims = list(range(x.dim())) if dim is None else dim
+    return std(x, dim, correction=correction, keepdim=keepdim), x.mean(dims, keepdim=keepdim)
+
+
 def vector_norm(x, ord=2, dim=None, keepdim=False, *, dtype=None):
     """``aten.linalg_vector_norm``. For the 2-norm, ``sqrt`` of the sum of
     squares with a gradient of 0 where the norm is 0, as PyTorch's backward
@@ -51,5 +73,8 @@ def vector_norm(x, ord=2, dim=None, keepdim=False, *, dtype=None):
 #: The decompositions, by ATen op overload.
 DECOMPOSITIONS = {
     aten.var.correction: var,
+    aten.std.correction: std,
+    aten.var_mean.correction: var_mean,
+    aten.std_mean.correction: std_mean,
     aten.linalg_vector_norm.default: vector_norm,
 }
