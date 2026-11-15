@@ -8,6 +8,8 @@ parameters after every step, on every engine and every cut budget.
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 from harness import make_engine, refusals_are_skips
@@ -41,8 +43,9 @@ def optimizers(draw):
     clip=st.sampled_from([None, 0.5]),
     budget=st.sampled_from(["default", 2]),
     seed=st.integers(0, 2**16),
+    width=st.sampled_from([1, 2]),
 )
-def test_training_matches_pytorch(engine, optimizer, steps, clip, budget, seed):
+def test_training_matches_pytorch(engine, optimizer, steps, clip, budget, seed, width):
     kind, kwargs = optimizer
     note(f"{kind}({kwargs}), clip={clip}")
     if engine == "duckdb" and budget != "default":
@@ -51,9 +54,12 @@ def test_training_matches_pytorch(engine, optimizer, steps, clip, budget, seed):
     def train(device):
         torch.manual_seed(seed)
         model = torch.nn.Sequential(
-            torch.nn.Linear(3, 4), torch.nn.Tanh(), torch.nn.Linear(4, 2)
+            # width 1: a one-element bias, as a regression head has (#27).
+            torch.nn.Linear(3, 4),
+            torch.nn.Tanh(),
+            torch.nn.Linear(4, width),
         ).double()
-        x, y = torch.randn(5, 3, dtype=F64), torch.randn(5, 2, dtype=F64)
+        x, y = torch.randn(5, 3, dtype=F64), torch.randn(5, width, dtype=F64)
         if device == "sql":
             model, x, y = model.to("sql"), x.to("sql"), y.to("sql")
         opt = getattr(torch.optim, kind)(model.parameters(), **kwargs)
@@ -90,3 +96,26 @@ def test_adam_amsgrad_foreach(engine):
         opt = torch.optim.Adam(model.parameters(), amsgrad=True, foreach=True)
         model(torch.randn(3, 2, dtype=F64).to("sql")).sum().backward()
         opt.step()
+
+
+@pytest.mark.pinned
+@pytest.mark.parametrize("engine", sorted(engines.ENGINES))
+def test_clipping_a_one_element_gradient(engine):
+    """``clip_grad_norm_`` takes the norm of each gradient. PyTorch's
+    reference ``vector_norm`` of a one-element tensor calls
+    ``aten.flatten.using_ints``, which had no lowering (#27), so a model
+    with a one-element parameter (``Linear(n, 1)``'s bias) couldn't clip.
+    The property above treats that refusal as a skip, so this pins it."""
+    torch.manual_seed(0)
+    cpu = torch.nn.Linear(2, 1).double()
+    x = torch.randn(3, 2, dtype=F64)
+    with torch_sql.Environment(make_engine(engine)):
+        dev = copy.deepcopy(cpu).to("sql")
+        dev(x.to("sql")).sum().backward()
+        norm = torch.nn.utils.clip_grad_norm_(dev.parameters(), 0.5)
+        got = [p.grad.cpu() for p in dev.parameters()]
+    cpu(x).sum().backward()
+    want_norm = torch.nn.utils.clip_grad_norm_(cpu.parameters(), 0.5)
+    torch.testing.assert_close(norm.cpu(), want_norm)
+    for g, p in zip(got, cpu.parameters(), strict=True):
+        torch.testing.assert_close(g, p.grad)
