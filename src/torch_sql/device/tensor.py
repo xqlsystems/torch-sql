@@ -264,5 +264,23 @@ class Tensor(torch.Tensor):
         memo[id(self)] = new
         return new
 
+    def __format__(self, spec):
+        """``f"{loss:.4f}"`` reads a one-element value, as PyTorch's own
+        ``__format__`` does for a plain tensor."""
+        if self.dim() == 0:
+            return self.item().__format__(spec)
+        return object.__format__(self, spec)
+
     def __reduce_ex__(self, protocol):
-        raise TypeError("a torch-sql tensor can't be pickled yet; move it to the CPU first")
+        """Pickled as its value on the CPU, so that ``torch.save`` of a
+        ``state_dict`` or an optimizer's makes a checkpoint any PyTorch can
+        read. A table outlives neither its environment nor its engine, so a
+        tensor can't be saved on ``sql``. ``load_state_dict`` copies the CPU
+        values back into the model's torch-sql tensors, and an optimizer's
+        moves its state to its parameters' device."""
+        cpu = self.detach().cpu().requires_grad_(self.requires_grad)
+        if getattr(self, "_is_param", False):
+            from collections import OrderedDict
+
+            return torch._utils._rebuild_parameter, (cpu, self.requires_grad, OrderedDict())
+        return cpu.__reduce_ex__(protocol)

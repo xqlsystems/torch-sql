@@ -20,14 +20,22 @@ jobs:
   soak:
     if: github.event.schedule == '0 6 * * *' || inputs.job == 'soak'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # One job per file: the whole suite at the nightly profile takes longer
+    # than a job may run, and one slow file shouldn't cancel the others.
+    strategy:
+      fail-fast: false
+      matrix:
+        file: [aliases, budget, device, generator, training]
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-extras --locked
       # A fresh seed every night, so each run explores new programs; the
       # seed is in the log for a replay.
-      - run: uv run pytest tests/fuzz -m "not pinned" --hypothesis-seed=${{ github.run_id }}
+      - run: >-
+          uv run pytest tests/fuzz/test_fuzz_${{ matrix.file }}.py -m "not pinned"
+          --hypothesis-seed=${{ github.run_id }} --durations=10
         env:
           HYPOTHESIS_PROFILE: nightly
 

@@ -672,6 +672,13 @@ parameter, which xarray-sql then registers. This gives the structure of a
 model from running its code, and its weights from data, with no `torch.export`
 step (decision D1). Where the extension lives is open (§17).
 
+Until then, a checkpoint goes through the CPU. `torch.save` pickles a
+torch-sql tensor as its value on the CPU, since a table lives only as long as
+its environment and its engine. So a saved `state_dict`, a model's or an
+optimizer's, is an ordinary PyTorch checkpoint. `load_state_dict` copies the
+values back into a model's tensors on `sql`, and an optimizer's moves its state
+to its parameters' device.
+
 ### 7.3 Changes to Samudra
 
 The goal is very few changes to how the model is written. The co-processor
@@ -741,14 +748,25 @@ It holds no strides. A view (§8.5) is a different query over the same table.
 ### 8.2 Dtypes
 
 Float64 is the default for verification, because it makes disagreements with
-PyTorch easy to see. Integer and boolean tensors are supported for indices
-and masks. Float32 isn't supported yet. Samudra's production configuration
-trains in it (§7.3), and both SQL engines have it, as `REAL`, so it comes
-before Samudra training (M3, §16); the reductions and the NaN checks of
-§9.4 need checking in it. bfloat16 and other low-precision types are
-open (§17), since neither SQL engine has them and einfold only handles
-`DOUBLE` today. An op whose result PyTorch gives in an unsupported dtype,
-such as `int / int`, which is float32, is refused with an error.
+PyTorch easy to see. Float32, PyTorch's default and what Samudra's production
+configuration trains in (§7.3), is `REAL` on both engines. Integer and
+boolean tensors are supported for indices and masks.
+
+A float32 table holds `REAL` values, and each float32 op's result is cast to
+`REAL` where it's computed, so every op rounds to float32, as PyTorch's do.
+Inside one op an engine may compute in `DOUBLE`: both give `SUM` and `AVG` of
+`REAL` as `DOUBLE`, and DuckDB gives `exp`, `ln` and `tanh` that way too. A
+float32 op's result can then differ from PyTorch's CPU kernel by rounding, as
+two of PyTorch's own kernels can. The tests hold float32 to PyTorch's default
+float32 tolerances, and nanoGPT trains in float32 within 1e-5 of PyTorch over
+three steps. A number in a float32 op is cast to `REAL` first, as PyTorch
+converts it to float32. ddx differentiates `REAL` columns and gives their
+gradients as `REAL`.
+
+bfloat16 and other low-precision types are open (§17), since neither SQL
+engine has them and einfold only handles `DOUBLE` today. An op whose result
+PyTorch gives in an unsupported dtype, such as `x.half()`, is refused with an
+error.
 
 Integer overflow differs by engine. DataFusion wraps around, as PyTorch
 does, and DuckDB raises an error (`2**62 * 4`, say). Neither gives a

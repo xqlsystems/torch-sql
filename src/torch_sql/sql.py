@@ -5,7 +5,10 @@ the same there (P1). Where the two engines read a construct differently,
 the writer picks a spelling both read alike:
 
 - a float literal is written with an exponent (``0.5e0``), which both read
-  as DOUBLE; DuckDB reads ``0.5`` as a DECIMAL;
+  as DOUBLE; DuckDB reads ``0.5`` as a DECIMAL. A float32 one is cast to
+  REAL, as PyTorch converts a number to float32 for a float32 op;
+- a float32 value is cast to REAL where it's computed, since the engines
+  give some functions and aggregates of REAL as DOUBLE, and differ on which;
 - infinities and NaN are read from a one-row table every engine registers,
   :data:`IEEE`, since ddx refuses to differentiate a query that holds a
   non-finite literal (xqlsystems/ddx#261). Outside a ``SELECT`` that a
@@ -107,12 +110,14 @@ def literal(value, dtype: torch.dtype) -> str:
     if dtype == torch.int64:
         return str(int(value))
     value = float(value)
+    sql_type = SQL_TYPES[dtype]
     if math.isnan(value):
-        return "CAST('NaN' AS DOUBLE)"
+        return f"CAST('NaN' AS {sql_type})"
     if math.isinf(value):
-        return f"CAST('{'-' if value < 0 else ''}inf' AS DOUBLE)"
+        return f"CAST('{'-' if value < 0 else ''}inf' AS {sql_type})"
     s = repr(value)
-    return s if "e" in s else f"{s}e0"
+    s = s if "e" in s else f"{s}e0"
+    return s if dtype == torch.float64 else f"CAST({s} AS {sql_type})"
 
 
 def expr(e: Expr, aliases: list[str], ieee: str | None = None, grouped: bool = False) -> str:
@@ -154,13 +159,21 @@ def expr(e: Expr, aliases: list[str], ieee: str | None = None, grouped: bool = F
     raise TypeError(f"not an expression: {e!r}")
 
 
-def cast_to(e: Expr, dtype: torch.dtype) -> Call:
+def cast_to(e: Expr, dtype: torch.dtype, source: torch.dtype | None = None) -> Expr:
+    """``e``, of dtype ``source``, cast to ``dtype``. Only a float64 value
+    can pass float32's range (:func:`real`); a BIGINT or a BOOLEAN casts to
+    REAL directly, rounding as PyTorch does."""
+    if dtype == torch.float32 and source == torch.float64:
+        return real(e)
     return Call(f"cast:{SQL_TYPES[dtype]}", (e,))
 
 
 def select(node: Select, resolve=lambda n: n) -> str:
     aliases = [f"t{k}" for k in range(len(node.inputs))]
-    nonfinite = any(_nonfinite(sub) for e in node.expressions() for sub in walk(e))
+    value = node.value
+    if node.dtype == torch.float32 and not _reads_real(node):
+        value = _to_real(value, node)
+    nonfinite = any(_nonfinite(sub) for e in (*node.expressions(), value) for sub in walk(e))
     ieee = "tieee" if nonfinite else None
     # Attach each equality to the latest input it reads, so that every input
     # joins on the ones before it; an input no equality reaches is a cross
@@ -187,7 +200,7 @@ def select(node: Select, resolve=lambda n: n) -> str:
         f"{expr(e, aliases, ieee, grouped)} AS {c}"
         for e, c in zip(node.index, node.columns, strict=True)
     ]
-    cols.append(f"{expr(node.value, aliases, ieee, grouped)} AS v")
+    cols.append(f"{expr(value, aliases, ieee, grouped)} AS v")
     sql = f"SELECT {', '.join(cols)}"
     if parts:
         sql += f" FROM {' '.join(parts)}"
@@ -199,6 +212,74 @@ def select(node: Select, resolve=lambda n: n) -> str:
     if node.group and keys:
         sql += f" GROUP BY {', '.join(keys)}"
     return sql
+
+
+#: The least DOUBLE that rounds to float32's infinity: halfway between
+#: float32's largest finite value and 2**128.
+_REAL_OVERFLOW = 3.4028235677973366e38
+
+
+def _to_real(e: Expr, node: Select) -> Expr:
+    """``e`` cast to REAL. Each float32 op rounds its result to float32, as
+    PyTorch's do; an engine computes some of it in DOUBLE (SUM and AVG of
+    REAL, and DuckDB's exp, ln and tanh)."""
+    if not _may_be_double(e, node):
+        return Call("cast:REAL", (e,))
+    return real(e)
+
+
+def real(e: Expr) -> Expr:
+    """``e``, which may be DOUBLE, cast to REAL. DuckDB raises on a DOUBLE
+    past REAL's range, where IEEE rounding, DataFusion and PyTorch give an
+    infinity, so such a value is rounded to one first. Below that, DuckDB's
+    cast rounds as IEEE does.
+
+    The infinity is added to ``e`` rather than put in its place, so that
+    ``e``'s gradient passes through unchanged, as PyTorch's does through a
+    rounding to infinity: a constant in its place had a gradient of 0, which
+    reached every element of a sum that overflowed. A NaN compares false and
+    adds -0."""
+    big = Lit(_REAL_OVERFLOW, torch.float64)
+    offset = Call(
+        "case",
+        (
+            Call(">=", (e, big)),
+            Lit(math.inf, torch.float64),
+            Call(
+                "case",
+                (
+                    Call("<=", (e, Lit(-_REAL_OVERFLOW, torch.float64))),
+                    Lit(-math.inf, torch.float64),
+                    # -0.0, which keeps the sign of a -0.0: 0.0 + -0.0 is 0.0.
+                    Lit(-0.0, torch.float64),
+                ),
+            ),
+        ),
+    )
+    return Call("cast:REAL", (Call("+", (e, offset)),))
+
+
+def _may_be_double(e: Expr, node: Select) -> bool:
+    """Whether an engine may compute ``e`` in DOUBLE: it reads a float64
+    column or constant, or applies a function or an aggregate. Arithmetic of
+    REAL stays REAL, and overflows to an infinity, on both engines."""
+    for sub in walk(e):
+        if isinstance(sub, Agg) or (isinstance(sub, Call) and sub.fn in FUNCTIONS):
+            return True
+        if isinstance(sub, Lit) and (sub.dtype == torch.float64 or _nonfinite(sub)):
+            # An infinity or a NaN is read as DOUBLE, from IEEE.
+            return True
+        if isinstance(sub, Col) and node.inputs[sub.input].dtype == torch.float64:
+            return True
+        if isinstance(sub, Call) and sub.fn.startswith("cast:") and sub.fn != "cast:REAL":
+            return True
+    return False
+
+
+def _reads_real(node: Select) -> bool:
+    """Whether ``node``'s value is a float32 column of an input as it is."""
+    v = node.value
+    return isinstance(v, Col) and node.inputs[v.input].dtype == torch.float32
 
 
 def _cols(e: Expr):

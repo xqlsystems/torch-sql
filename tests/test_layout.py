@@ -53,6 +53,13 @@ def test_null_is_refused():
         to_dense(table, (2,), torch.float64)
 
 
-def test_float32_is_refused_for_now():
-    with pytest.raises(NotImplementedError, match="float32"):
-        to_table(torch.randn(2))
+def test_float32_is_real():
+    x = torch.randn(2, 3)
+    table = to_table(x)
+    assert table.schema.field("v").type == pa.float32()
+    assert torch.equal(to_dense(table, (2, 3), torch.float32), x)
+
+
+def test_half_precision_is_refused():
+    with pytest.raises(NotImplementedError, match="float16"):
+        to_table(torch.randn(2).half())

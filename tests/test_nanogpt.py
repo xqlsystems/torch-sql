@@ -15,12 +15,12 @@ import torch_sql
 F64 = torch.float64
 
 
-def gpt(layers=1, dropout=0.0):
+def gpt(layers=1, dropout=0.0, dtype=F64):
     config = GPTConfig(
         block_size=8, vocab_size=11, n_layer=layers, n_head=2, n_embd=8, dropout=dropout, bias=True
     )
     torch.manual_seed(0)
-    model = GPT(config).double()
+    model = GPT(config).to(dtype)
     for module in model.modules():
         for name, child in module.named_children():
             if isinstance(child, torch.nn.GELU):
@@ -37,14 +37,14 @@ def close(got, expected, tol=1e-11):
     torch.testing.assert_close(got.cpu(), expected.detach(), rtol=tol, atol=tol)
 
 
-def train(engine, layers, steps):
+def train(engine, layers, steps, dtype=F64, tol=1e-11):
     """Train nanoGPT as its train.py does (AdamW from configure_optimizers,
     gradients clipped to norm 1) on the CPU and on device="sql", and check
     the loss, every gradient and every parameter after each step."""
-    ref = gpt(layers)
+    ref = gpt(layers, dtype=dtype)
     ref_opt = ref.configure_optimizers(0.1, 1e-3, (0.9, 0.99), "cpu")
     with torch_sql.Environment(engine):
-        model = gpt(layers).to("sql")
+        model = gpt(layers, dtype=dtype).to("sql")
         assert model.lm_head.weight is model.transformer.wte.weight  # still tied
         opt = model.configure_optimizers(0.1, 1e-3, (0.9, 0.99), "cpu")
         for step in range(steps):
@@ -62,10 +62,10 @@ def train(engine, layers, steps):
             opt.step()
             opt.zero_grad(set_to_none=True)
 
-            close(loss, ref_loss)
+            close(loss, ref_loss, tol)
             for g, p, r in zip(grads, model.parameters(), ref.parameters(), strict=True):
-                assert g.shape == p.shape
-                close(p, r)
+                assert g.shape == p.shape and g.dtype == dtype
+                close(p, r, tol)
 
 
 def test_forward_and_gradients(engine):
@@ -92,6 +92,11 @@ def test_trains_two_layers(engine):
     # Without cut points, DataFusion runs out of memory planning two layers'
     # loss, since it plans a CTE again at every read (xarray-sql#267).
     train(engine, layers=2, steps=2)
+
+
+def test_trains_in_float32(engine):
+    # PyTorch's default dtype, as nanoGPT's train.py runs on the CPU.
+    train(engine, layers=1, steps=3, dtype=torch.float32, tol=1e-5)
 
 
 def test_inference_reads_the_last_position(engine):

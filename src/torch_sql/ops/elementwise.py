@@ -31,10 +31,11 @@ from . import Context, op
 from ._build import elementwise, python_dtype, scalar
 
 aten = torch.ops.aten
-FLOATS = (torch.float64,)
+FLOATS = (torch.float64, torch.float32)
 
 NAN = g.Lit(math.nan, torch.float64)
 NEG_INF = g.Lit(-math.inf, torch.float64)
+INF = g.Lit(math.inf, torch.float64)
 
 
 def out_of(ctx: Context):
@@ -98,10 +99,9 @@ def compare(cmp: str, a: g.Expr, b: g.Expr, floating: bool) -> g.Expr:
 
 def comparison_dtype(ctx: Context, a, b) -> torch.dtype:
     """The dtype PyTorch compares ``a`` and ``b`` in. For an integer tensor
-    against a Python float, PyTorch compares in the default float dtype,
-    float32; torch-sql compares in float64, which it supports, and which
-    agrees with float32 except for integers beyond 2**24 that float32 can't
-    tell apart."""
+    against a Python float, it's the default float dtype, float32 unless
+    ``torch.set_default_dtype`` says otherwise, which can't tell apart
+    integers beyond 2**24."""
 
     def meta(x):
         if isinstance(x, g.Node):
@@ -109,8 +109,7 @@ def comparison_dtype(ctx: Context, a, b) -> torch.dtype:
         return x
 
     with torch._C.DisableTorchFunction():
-        dtype = torch.result_type(meta(a), meta(b))
-    return torch.float64 if dtype.is_floating_point else dtype
+        return torch.result_type(meta(a), meta(b))
 
 
 # ----------------------------------------------------------------------------
@@ -216,10 +215,37 @@ def log(ctx, x):
     # ln(0) is -inf and ln(x < 0) is NaN, as in PyTorch; DuckDB raises on
     # both. A NaN takes the first branch on DuckDB and the last on
     # DataFusion if its sign bit is set; either way the result is NaN, so
-    # this needs no isnan. sqrt and rsqrt are the same.
+    # this needs no isnan. sqrt and rsqrt are the same. At 0 the value is
+    # -inf * (1 - v), which is -inf with a gradient of +inf, PyTorch's 1/0;
+    # a constant -inf would have a gradient of 0.
     def fn(v):
-        zero = scalar(0.0, ctx.out.dtype)
-        return case(g.call(">", v, zero), g.call("ln", v), case(g.call("=", v, zero), NEG_INF, NAN))
+        zero, one = scalar(0.0, ctx.out.dtype), scalar(1.0, ctx.out.dtype)
+        at_zero = NEG_INF * (one - v)
+        return case(g.call(">", v, zero), g.call("ln", v), case(g.call("=", v, zero), at_zero, NAN))
+
+    return unary(ctx, x, fn)
+
+
+@op(aten.log1p.default)
+def log1p(ctx, x):
+    """``ln(1 + v)``, without losing ``v``'s digits when it's small, which
+    ``ln(1 + v)`` itself does. For ``|v| < 1``, ``v * ln(u) / (u - 1)``,
+    with ``u = 1 + v`` as rounded (Theorem 4 of Goldberg's "What every
+    computer scientist should know about floating-point arithmetic"); its
+    derivative loses digits for large ``v``, where ``ln(u)`` is accurate.
+    No engine has ``log1p``. The binary cross-entropy losses and
+    ``softplus`` call it."""
+
+    def fn(v):
+        one, zero = scalar(1.0, ctx.out.dtype), scalar(0.0, ctx.out.dtype)
+        u = one + v
+        small = case(g.call("=", u, one), v, v * g.call("ln", u) / (u - one))
+        # At -1, -inf with a gradient of +inf, as log's at 0.
+        at_minus_one = NEG_INF * (one - v)
+        ln = case(
+            g.call(">", u, zero), g.call("ln", u), case(g.call("=", u, zero), at_minus_one, NAN)
+        )
+        return case(g.call("<", g.call("abs", v), one), small, ln)
 
     return unary(ctx, x, fn)
 
@@ -244,8 +270,47 @@ def tanh(ctx, x):
 
 @op(aten.sigmoid.default)
 def sigmoid(ctx, x):
-    one = scalar(1.0, ctx.out.dtype)
-    return unary(ctx, x, lambda v: one / (one + g.call("exp", negate(v, ctx.out.dtype))))
+    """``1 / (1 + e)`` for ``v >= 0`` and ``e / (1 + e)`` below, with ``e =
+    exp(-|v|)``, as PyTorch computes it. ``e`` is at most 1, so neither
+    branch's gradient overflows: ``1 / (1 + exp(-v))`` alone has a gradient
+    of inf / inf, NaN, below about -709 (issue #35)."""
+    one, zero = scalar(1.0, ctx.out.dtype), scalar(0.0, ctx.out.dtype)
+
+    def fn(v):
+        positive = g.call(">=", v, zero)
+        e = g.call("exp", case(positive, negate(v, ctx.out.dtype), v))
+        if ctx.out.dtype == torch.float32:
+            # Rounded, as PyTorch's float32 kernel: 1 + e is then exactly 1
+            # above about 16.6, so sigmoid saturates where PyTorch's does.
+            # An engine computes exp in DOUBLE.
+            e = g.call("cast:REAL", e)
+        return case(positive, one / (one + e), e / (one + e))
+
+    out = unary(ctx, x, fn)
+    if ctx.out.dtype != torch.float32:
+        return out
+    return _with_slope(ctx, x, out, lambda s: s * (one - s))
+
+
+def _with_slope(ctx, x, out, slope):
+    """``out``, whose gradient is ``slope(out)``, computed from ``out`` as
+    rounded, as PyTorch's float32 backward computes it: ``out`` plus ``(x -
+    x.detach())`` times the detached slope, which is 0. ddx would compute
+    the derivative from ``x`` in DOUBLE. Where ``out`` rounds to exactly 1,
+    ``sigmoid``'s is about 2e-9 at 20 where PyTorch's ``out * (1 - out)`` is
+    0, and ``binary_cross_entropy``'s backward, which divides by ``max(p * (1
+    - p), 1e-12)``, made that into a gradient of 1,443. An infinite ``x``
+    takes the slope as 0, rather than ``inf - inf``."""
+    shape, dtype = out_of(ctx)
+    stop = lambda n: g.identity(n, stop_gradient=True)  # noqa: E731
+    k = elementwise(shape, dtype, [out], slope)
+    zero = scalar(0.0, dtype)
+
+    def fn(o, v, v0, k):
+        dv = v - v0
+        return o + case(g.call("isnan", dv), zero, dv) * k
+
+    return elementwise(shape, dtype, [stop(out), x, stop(x), stop(k)], fn)
 
 
 @op(aten.abs.default)
@@ -365,11 +430,13 @@ def clamp(ctx, x, min=None, max=None):
         lo = bounds.pop(0) if min is not None else None
         hi = bounds.pop(0) if max is not None else None
         # min(max(v, lo), hi), as PyTorch computes it: hi wins when lo > hi.
+        # At a bound the value is the bound's, which gets the gradient, as
+        # PyTorch's clamp gives v none there.
         out = v
         if lo is not None:
-            out = case(g.call("<", out, lo), lo, out)
+            out = case(g.call("<=", out, lo), lo, out)
         if hi is not None:
-            out = case(g.call(">", out, hi), hi, out)
+            out = case(g.call(">=", out, hi), hi, out)
         if dt in FLOATS:
             nan = any_of(isnan(v), *(isnan(b) for b in (lo, hi) if b is not None))
             out = case(nan, NAN, out)
@@ -394,6 +461,23 @@ def isnan_(ctx, x):
         return unary(ctx, x, lambda v: g.Lit(False, torch.bool))
     return elementwise(
         ctx.out.shape, torch.bool, [x], lambda v: g.call("isnan", v), compute=x.dtype
+    )
+
+
+@op(aten.isinf.default)
+def isinf(ctx, x):
+    """``isfinite`` decomposes into this and ``isnan``; ``clip_grad_norm_``
+    with ``error_if_nonfinite=True`` reads it."""
+    if x.dtype not in FLOATS:
+        return unary(ctx, x, lambda v: g.Lit(False, torch.bool))
+    return elementwise(
+        ctx.out.shape,
+        torch.bool,
+        [x],
+        lambda v: g.call(
+            "and", g.call("not", g.call("isnan", v)), g.call("=", g.call("abs", v), INF)
+        ),
+        compute=x.dtype,
     )
 
 

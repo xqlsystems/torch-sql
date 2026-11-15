@@ -46,7 +46,7 @@ def reduce(ctx, x: g.Node, dim, keepdim: bool, agg: str, *, dtype=None) -> g.Sel
     compute = out.dtype
     v = as_dtype(g.Col(0, "v"), x.dtype, compute)
     value = g.Agg(agg, v)
-    if agg == "MAX" and compute == torch.float64:
+    if agg == "MAX" and compute.is_floating_point:
         flag = g.call("case", g.call("isnan", v), g.Lit(1, torch.int64), g.Lit(0, torch.int64))
         nan = g.call("=", g.Agg("MAX", flag), g.Lit(1, torch.int64))
         if any(d not in dims for d in range(x.rank)):
@@ -82,7 +82,7 @@ def amax(ctx, x, dim=(), keepdim=False):
 
 @op(aten.amin.default, aten.min.default)
 def amin(ctx, x, dim=(), keepdim=False):
-    if x.dtype != torch.float64:
+    if not x.dtype.is_floating_point:
         return reduce(ctx, x, dim, keepdim, "MIN")
     minus = g.Lit(-1.0, torch.float64)
     negated = g.Select(
@@ -115,7 +115,7 @@ def _arg_extremum(ctx, x, dim, keepdim, extremum, shape):
     m = extremum(Context(ctx.func, meta, ctx.env), x, dims, False)
     v, best = g.Col(0, "v"), g.Col(1, "v")
     hit = g.call("=", v, best)
-    if x.dtype == torch.float64:
+    if x.dtype.is_floating_point:
         hit = g.call("or", hit, g.call("and", g.call("isnan", v), g.call("isnan", best)))
     flat, stride = g.Lit(0, torch.int64), 1
     for d in reversed(dims):

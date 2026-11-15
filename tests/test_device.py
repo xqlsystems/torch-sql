@@ -311,16 +311,17 @@ def test_cpu_tensors_beside_sql_ones(env):
         x + torch.ones(2, dtype=F64)
 
 
-def test_true_division_of_integers_is_refused(env):
-    # PyTorch gives float32, which torch-sql doesn't support yet (§8.2).
-    a = torch.arange(1, 4, device="sql")
-    with pytest.raises(NotImplementedError, match="float32"):
-        a / a
+def test_true_division_of_integers(env):
+    # PyTorch gives the default dtype, float32.
+    a = torch.arange(1, 4)
+    got = a.to("sql") / 2
+    assert got.dtype == torch.float32
+    same(got, a / 2)
 
 
 def test_unsupported_dtype_is_refused(env):
-    with pytest.raises(NotImplementedError, match="float32"):
-        torch.ones(2, device="sql")
+    with pytest.raises(NotImplementedError, match="bfloat16"):
+        torch.ones(2, dtype=torch.bfloat16, device="sql")
 
 
 def test_exact_gelu_is_refused(env):
@@ -645,3 +646,315 @@ def test_clip_grad_norm_of_a_one_element_bias(env):
         torch.nn.utils.clip_grad_norm_(m.parameters(), 0.5)
     for p, q in zip(model.parameters(), device.parameters(), strict=True):
         torch.testing.assert_close(q.grad.cpu(), p.grad)
+
+
+# -- Found by using it ------------------------------------------------------
+# Each is a habit of ordinary PyTorch training code.
+
+
+def test_device_sql_outside_an_environment():
+    with pytest.raises(RuntimeError, match="outside a torch_sql.Environment"):
+        torch.zeros(2, dtype=F64, device="sql")
+
+
+def test_a_cpu_tensor_beside_a_torch_sql_one(env):
+    model = torch.nn.Linear(2, 1).double().to("sql")
+    with pytest.raises(RuntimeError, match="same device, but found .* sql and cpu"):
+        model(torch.ones(3, 2, dtype=F64))
+    with pytest.raises(RuntimeError, match="same device"):
+        torch.ones(2, dtype=F64, device="sql") + torch.ones(2, dtype=F64)
+    # A 0-d CPU tensor is a number, as in PyTorch.
+    same(
+        torch.ones(2, dtype=F64, device="sql") * torch.tensor(2.0, dtype=F64),
+        torch.full((2,), 2.0, dtype=F64),
+    )
+
+
+def test_half_precision_refusal_says_what_to_do(env):
+    with pytest.raises(NotImplementedError, match="float"):
+        torch.nn.Linear(2, 1).half().to("sql")
+
+
+def test_format_of_a_scalar(env):
+    loss = torch.tensor([1.0, 2.5], dtype=F64, device="sql").sum()
+    assert f"loss {loss:.3f}" == "loss 3.500"
+    with pytest.raises(TypeError):
+        f"{torch.ones(2, dtype=F64, device='sql'):.3f}"
+
+
+def test_where_with_a_number(env):
+    x = torch.tensor([-1.0, 2.0, -3.0], dtype=F64)
+    s = x.to("sql")
+    same(torch.where(s > 0, s, 0.0), torch.where(x > 0, x, 0.0))
+    same(torch.where(s > 0, -1, s), torch.where(x > 0, -1, x))
+    same(s.where(s > 0, 0), x.where(x > 0, 0))
+    i = torch.tensor([1, -2, 3])
+    assert torch.equal(torch.where(i.to("sql") > 0, i.to("sql"), 0).cpu(), torch.where(i > 0, i, 0))
+
+
+def test_a_boolean_mask_index_is_refused_clearly(env):
+    x = torch.arange(4, dtype=F64, device="sql")
+    with pytest.raises(NotImplementedError, match="torch.where"):
+        x[x > 1]
+    with pytest.raises(NotImplementedError, match="torch.where"):
+        torch.nonzero(x)
+
+
+def test_checkpoint_and_resume(env):
+    """torch.save of a model's and an optimizer's state_dict saves CPU
+    values; loading them into a fresh model, on another engine, resumes
+    training as PyTorch does."""
+    import io
+
+    def model():
+        torch.manual_seed(0)
+        return torch.nn.Sequential(
+            torch.nn.Linear(3, 4), torch.nn.Tanh(), torch.nn.Linear(4, 1)
+        ).double()
+
+    torch.manual_seed(1)
+    x, y = torch.randn(8, 3, dtype=F64), torch.randn(8, 1, dtype=F64)
+
+    def train(m, opt, device, steps):
+        losses = []
+        for _ in range(steps):
+            opt.zero_grad()
+            loss = torch.nn.functional.mse_loss(m(x.to(device)), y.to(device))
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+        return losses
+
+    m = model()
+    opt = torch.optim.AdamW(m.parameters(), 0.05)
+    expected = train(m, opt, "cpu", 4)
+
+    m = model().to("sql")
+    opt = torch.optim.AdamW(m.parameters(), 0.05)
+    got = train(m, opt, "sql", 2)
+    saved = io.BytesIO()
+    torch.save({"model": m.state_dict(), "opt": opt.state_dict()}, saved)
+    saved.seek(0)
+    checkpoint = torch.load(saved)
+    assert all(v.device.type == "cpu" for v in checkpoint["model"].values())
+    with torch_sql.Environment("duckdb" if env.engine.name != "duckdb" else "datafusion"):
+        m = model().to("sql")
+        opt = torch.optim.AdamW(m.parameters(), 0.05)
+        m.load_state_dict(checkpoint["model"])
+        opt.load_state_dict(checkpoint["opt"])
+        got += train(m, opt, "sql", 2)
+    torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_saving_a_whole_module_keeps_its_parameters(env):
+    import io
+
+    saved = io.BytesIO()
+    torch.save(torch.nn.Linear(2, 1).double().to("sql"), saved)
+    saved.seek(0)
+    loaded = torch.load(saved, weights_only=False)
+    assert isinstance(loaded.weight, torch.nn.Parameter) and loaded.weight.device.type == "cpu"
+
+
+def test_clip_grad_norm_checks_for_non_finite_gradients(env):
+    model = torch.nn.Linear(2, 1).double().to("sql")
+    model(torch.ones(3, 2, dtype=F64, device="sql")).sum().backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1, error_if_nonfinite=True)
+    assert math.isfinite(norm.item())
+    model.zero_grad()
+    (model(torch.full((3, 2), INF, dtype=F64, device="sql")).sum()).backward()
+    with pytest.raises(RuntimeError, match="non-finite"):
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1, error_if_nonfinite=True)
+
+
+def test_log1p_keeps_small_values_digits(env):
+    x = torch.tensor(
+        [1e-20, -1e-10, 1e-5, 0.5, -0.5, 3.0, 1e10, -1.0, -2.0, INF, NAN, 0.0], dtype=F64
+    )
+    s = x.to("sql").requires_grad_()
+    out = torch.log1p(s)
+    torch.testing.assert_close(
+        out.detach().cpu(), torch.log1p(x), rtol=4e-16, atol=0, equal_nan=True
+    )
+    (out * torch.tensor([1.0] * 7 + [0.0] * 5, dtype=F64, device="sql")).sum().backward()
+    xr = x.clone().requires_grad_()
+    (torch.log1p(xr) * torch.tensor([1.0] * 7 + [0.0] * 5, dtype=F64)).sum().backward()
+    torch.testing.assert_close(s.grad.cpu()[:7], xr.grad[:7], rtol=1e-15, atol=0)
+
+
+def test_to_with_keywords_in_nested_environments(env):
+    # An optimizer's load_state_dict moves its state this way.
+    with torch_sql.Environment("duckdb" if env.engine.name != "duckdb" else "datafusion") as inner:
+        t = torch.ones(2, dtype=F64).to(dtype=F64, device=torch.device("sql"))
+        assert t._env is inner
+
+
+def test_float32_past_its_range_is_infinite(env):
+    # DuckDB computes a float32 sum or exp in DOUBLE, and raises on casting
+    # one past REAL's range, where PyTorch gives an infinity.
+    x = torch.tensor([3e38, 3e38])
+    same(x.to("sql").sum(), x.sum())
+    same((-x).to("sql").sum(), (-x).sum())
+    y = torch.tensor([100.0, 1.0, float("nan")])
+    same(y.to("sql").exp(), y.exp())
+
+
+def test_var_of_a_scalar_along_a_dimension(env):
+    x = torch.tensor(2.0, dtype=F64)
+    for dim in (0, -1):
+        same(torch.var(x.to("sql"), dim=dim, correction=0), torch.var(x, dim=dim, correction=0))
+
+
+def test_foreach_with_a_cpu_tensor_of_scalars(env):
+    p = [torch.zeros(2, dtype=F64, device="sql")]
+    a = [torch.ones(2, dtype=F64, device="sql")]
+    torch._foreach_addcmul_(p, a, a, torch.tensor([2.0], dtype=F64))
+    same(p[0], torch.full((2,), 2.0, dtype=F64))
+
+
+def test_cosine_similarity_of_integers_and_of_large_vectors(env):
+    f = torch.nn.functional.cosine_similarity
+    i, x = torch.tensor([3, 4]), torch.tensor([3.0, 4.0], dtype=F64)
+    same(f(i.to("sql"), x.to("sql"), dim=0), f(i, x, dim=0))
+    big, one = torch.tensor([[1e20, 1e20]]), torch.tensor([[1.0, 1.0]])
+    same(f(big.to("sql"), one.to("sql")), f(big, one))
+    # Below eps, the clamp changes the norm's value but not its gradient.
+    small = torch.tensor([[1e-10, 0.0]], dtype=F64, requires_grad=True)
+    f(small, x[None]).sum().backward()
+    s = small.detach().to("sql").requires_grad_()
+    f(s, x[None].to("sql")).sum().backward()
+    torch.testing.assert_close(s.grad.cpu(), small.grad)
+
+
+def test_float32_constants_and_casts_past_its_range(env):
+    # DuckDB raises on casting a DOUBLE past REAL's range, as a float32
+    # constant or a float64 value made float32 would be.
+    x = torch.tensor([1.0, -1.0, 2.0])
+    same(x.to("sql") * 1e39, x * 1e39)
+    d = torch.tensor([1e39, -1e40, 1.0], dtype=F64)
+    same(d.to("sql").float(), d.float())
+    same(d.to("sql").float() + 1, d.float() + 1)
+    target = torch.zeros(3).to("sql")
+    target.copy_(d.to("sql"))
+    same(target, d.float())
+
+
+def test_the_gradient_of_a_norm_at_zero(env):
+    # PyTorch's backward gives 0 where the norm is 0; sqrt's would be 0/0.
+    f = torch.nn.functional
+    for fn in (
+        lambda a: torch.linalg.vector_norm(a, dim=1).sum(),
+        lambda a: f.normalize(a, dim=1).sum(),
+        lambda a: f.cosine_similarity(a, torch.ones_like(a)).sum(),
+    ):
+        a = torch.tensor([[0.0, 0.0, 0.0], [1.0, 2.0, 2.0]], dtype=F64, requires_grad=True)
+        fn(a).backward()
+        s = a.detach().to("sql").requires_grad_()
+        fn(s).backward()
+        torch.testing.assert_close(s.grad.cpu(), a.grad, rtol=1e-12, atol=1e-12)
+
+
+# -- Found by the adversary's review of #29 ----------------------------------
+
+
+def test_bool_and_int_to_float32(env):
+    pred, y = torch.tensor([1, 0, 2]), torch.tensor([1, 1, 2])
+    accuracy = (pred.to("sql") == y.to("sql")).float().mean()
+    same(accuracy, (pred == y).float().mean())
+    mask, x = torch.tensor([True, False]), torch.tensor([1.5, 2.5])
+    same(mask.to("sql") * x.to("sql"), mask * x)
+    same(mask.to("sql") + 0.5, mask + 0.5)
+    same(mask.to("sql").sum(dtype=torch.float32), mask.sum(dtype=torch.float32))
+    # Rounded once, as PyTorch does, not through DOUBLE first.
+    big = torch.tensor([2**60 + 2**36 + 1])
+    assert torch.equal(big.to("sql").float().cpu(), big.float())
+
+
+def test_gradient_of_std_where_it_is_zero(env):
+    # A constant feature, normalized: PyTorch's std_backward gives 0 there.
+    x = torch.tensor([[2.0, 1.0], [2.0, 3.0], [2.0, 4.0]], dtype=F64, requires_grad=True)
+    ((x - x.mean(0)) / (x.std(0) + 1e-5)).pow(2).sum().backward()
+    s = x.detach().to("sql").requires_grad_()
+    ((s - s.mean(0)) / (s.std(0) + 1e-5)).pow(2).sum().backward()
+    same(s.grad, x.grad)
+    for fn in (torch.var_mean, torch.std_mean):
+        for got, expected in zip(fn(s.detach(), 0), fn(x.detach(), 0), strict=True):
+            same(got, expected)
+
+
+def test_a_checkpoint_keeps_requires_grad(env):
+    import io
+
+    saved = io.BytesIO()
+    torch.save({"W": torch.randn(2, 1).to("sql").requires_grad_()}, saved)
+    saved.seek(0)
+    assert torch.load(saved)["W"].requires_grad
+
+
+def test_assigning_through_a_cpu_index(env):
+    # PyTorch on another device accepts a CPU index; the error is the op's.
+    x = torch.zeros(3, dtype=F64, device="sql")
+    with pytest.raises(NotImplementedError, match="index_put"):
+        x[torch.tensor([0, 2])] = 9.0
+    x[x < 1] = 4.0
+    same(x, torch.full((3,), 4.0, dtype=F64))
+
+
+def test_cosine_similarity_dtypes(env):
+    f = torch.nn.functional.cosine_similarity
+    i = torch.tensor([[3, 4]])
+    with pytest.raises(RuntimeError, match="floating point"):
+        f(i.to("sql"), i.to("sql"))
+    a, b = torch.tensor([[1.0, 2.0]]), torch.tensor([[3.0, 1.0]], dtype=F64)
+    same(f(a.to("sql"), b.to("sql")), f(a, b))
+    # A float64 scalar against a float32 vector, broadcast: float64, as in
+    # PyTorch, not narrowed to the vector's float32.
+    s, v = torch.tensor(1.0, dtype=F64), torch.tensor([1.0, 2.0])
+    expected = f(s, v, dim=0)
+    got = f(s.to("sql"), v.to("sql"), dim=0)
+    assert got.dtype == expected.dtype == F64
+    same(got, expected)
+
+
+def test_a_list_of_bools_as_an_index_is_refused_clearly(env):
+    with pytest.raises(NotImplementedError, match="boolean mask"):
+        torch.arange(3, dtype=F64, device="sql")[[True, False, True]]
+
+
+def test_new_tensor(env):
+    x = torch.ones(2, dtype=F64, device="sql")
+    t = x.new_tensor([1.0, 2.0])
+    assert isinstance(t, torch_sql.Tensor) and t.dtype == F64
+    same(t, torch.tensor([1.0, 2.0], dtype=F64))
+
+
+# -- Found by CodeRabbit's review of #29 -------------------------------------
+
+
+def test_norm_refuses_a_narrowing_dtype(env):
+    x = torch.tensor([3.0, 4.0], dtype=F64)
+    with pytest.raises(RuntimeError, match="dtype"):
+        torch.linalg.vector_norm(x.to("sql"), dtype=torch.float32)
+
+
+def test_float32_std_is_computed_wide(env):
+    # The variance of [-1e20, 1e20] passes float32's range; PyTorch
+    # accumulates it in float64, so the standard deviation doesn't.
+    x = torch.tensor([-1e20, 1e20])
+    for fn in (lambda t: torch.std(t, correction=0), lambda t: torch.std_mean(t, correction=0)[0]):
+        got = fn(x.to("sql"))
+        assert got.dtype == torch.float32
+        torch.testing.assert_close(got.cpu(), fn(x))
+    same(torch.var(x.to("sql"), correction=0), torch.var(x, correction=0))
+
+
+def test_new_tensor_devices_and_data(env):
+    s = torch.ones(2, dtype=F64, device="sql")
+    # A torch-sql tensor as data, copied.
+    same(s.new_tensor(s), torch.ones(2, dtype=F64))
+    # A CPU receiver keeps the CPU, whatever the data.
+    t = torch.ones(1).new_tensor(s)
+    assert t.device.type == "cpu" and t.dtype == torch.float32
+    # requires_grad, on either device.
+    assert s.new_tensor([1.0], device="cpu", requires_grad=True).requires_grad
+    assert s.new_tensor([1.0], requires_grad=True).requires_grad

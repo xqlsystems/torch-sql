@@ -32,7 +32,7 @@ def as_dtype(e: g.Expr, have: torch.dtype, want: torch.dtype) -> g.Expr:
         return e
     if isinstance(e, g.Lit):
         return scalar(e.value, want)
-    return cast_to(e, want)
+    return cast_to(e, want, have)
 
 
 def elementwise(shape, dtype, operands, fn, *, compute=None) -> g.Select:

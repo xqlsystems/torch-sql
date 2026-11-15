@@ -34,6 +34,18 @@ def _register():
     module.manual_seed_all = lambda seed: None
     torch._register_device_module("sql", module)
     tensor._SQL = torch.device("sql")
+    # Only an environment makes tensors on sql; without one, an op reaches
+    # PyTorch's dispatcher for the device, which has no kernels.
+    global _library
+    _library = torch.library.Library("_", "IMPL")
+    _library.fallback(_no_environment, dispatch_key="PrivateUse1")
+
+
+def _no_environment(op, *args, **kwargs):
+    raise RuntimeError(
+        f"{op} on device='sql' outside a torch_sql.Environment: run it inside "
+        "`with torch_sql.Environment():`"
+    )
 
 
 _register()

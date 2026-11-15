@@ -130,7 +130,9 @@ def backward(env, objective: g.Node, resolve: dict, wrt: list[g.Table]):
             for n in g.topological([node], lambda n: segment_resolve.get(n.id, n))
             if isinstance(n, g.Table)
         ]
-        targets = [t for t in reads if t.id in leaf_ids or (t.id in cut_of and t.dtype == F64)]
+        targets = [
+            t for t in reads if t.id in leaf_ids or (t.id in cut_of and t.dtype.is_floating_point)
+        ]
         if not targets:
             return None
         out = env.engine.grad(sql.query(node, segment_resolve), [f"{t.name}.v" for t in targets])

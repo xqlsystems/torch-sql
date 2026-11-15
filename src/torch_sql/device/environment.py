@@ -33,6 +33,7 @@ from ..boundary.layout import to_dense, to_table
 from ..engines import Engine
 from ..engines import engine as make_engine
 from ..ops import LOWERINGS, Context, OperatorNotFound
+from .decompositions import DECOMPOSITIONS as OWN_DECOMPOSITIONS
 from .functions import FUNCTIONS
 from .tensor import Storage, Tensor
 
@@ -43,6 +44,17 @@ aten = torch.ops.aten
 #: even for ops it holds.
 _table = torch._decomp.core_aten_decompositions()
 DECOMPOSITIONS = {op: _table[op] for op in _table}
+DECOMPOSITIONS.update(OWN_DECOMPOSITIONS)
+
+#: Ops whose result's shape depends on their input's values, which the meta
+#: device can't compute: ``x[mask]`` calls ``nonzero``.
+DATA_DEPENDENT = {
+    aten.nonzero.default,
+    aten.masked_select.default,
+    aten._unique2.default,
+    aten.unique_dim.default,
+    aten.unique_consecutive.default,
+}
 
 #: In-place ops that change their target's shape or strides.
 IN_PLACE_VIEWS = {
@@ -262,6 +274,16 @@ class Environment:
         special = _SPECIAL.get(func)
         if special is not None:
             return special(self, *args, **kwargs)
+        if func in DATA_DEPENDENT:
+            raise NotImplementedError(
+                f"{func} gives a result whose shape depends on the values (x[mask] calls "
+                "nonzero), which torch-sql can't plan; torch.where(mask, x, 0.0) or "
+                "x.masked_fill(~mask, 0.0) keep x's shape"
+            )
+        if not func._schema.name.startswith("aten::_foreach_"):
+            # A _foreach_ op reads a CPU tensor of scalars one by one; each
+            # element's op is checked as it's dispatched.
+            _check_devices(func, args, kwargs)
         if func._schema.name.startswith("aten::_foreach_"):
             return _foreach(self, func, args, kwargs)
         if func._schema.is_mutable:
@@ -270,6 +292,10 @@ class Environment:
         if lowering is None:
             decomposition = DECOMPOSITIONS.get(func)
             if decomposition is not None:
+                if func in OWN_DECOMPOSITIONS:
+                    # PyTorch's checks of the call: a norm's dtype that
+                    # narrows its input, a dimension out of range.
+                    self._meta(func, args, kwargs)
                 # It calls simpler ops, which come back here. Some create
                 # tensors on the input's device, sql to Python code and meta
                 # to C++; _Factories makes those torch-sql tensors.
@@ -314,7 +340,7 @@ class Environment:
             where=g.Lit(False, torch.bool),
             index=tuple(g.Lit(0, torch.int64) for _ in shape),
             value=g.Lit(0 if dtype != torch.bool else False, dtype)
-            if dtype != torch.float64
+            if not dtype.is_floating_point
             else g.Lit(0.0, dtype),
         )
 
@@ -522,7 +548,7 @@ def _stopped(nodes):
     a gradient: constants to the loss, as in PyTorch (§11.3)."""
     return tree_map(
         lambda n: g.identity(n, stop_gradient=True)
-        if isinstance(n, g.Node) and n.dtype == torch.float64
+        if isinstance(n, g.Node) and n.dtype.is_floating_point
         else n,
         nodes,
     )
@@ -580,6 +606,24 @@ def _untracked(target: Tensor) -> bool:
     if torch.is_grad_enabled() and target.grad_fn is not None:
         return False
     return target.grad_fn is not None or target._lineage.history or target._storage.history
+
+
+def _check_devices(func, args, kwargs):
+    """PyTorch's error for an op on tensors of two devices, which its meta
+    kernels would give as ``meta`` and ``cpu``. A 0-d CPU tensor acts as a
+    number, as in PyTorch."""
+    for a in torch.utils._pytree.tree_leaves((args, kwargs)):
+        if (
+            isinstance(a, torch.Tensor)
+            and not isinstance(a, Tensor)
+            and a.device.type == "cpu"
+            and a.dim() > 0
+        ):
+            raise RuntimeError(
+                "Expected all tensors to be on the same device, but found at least two "
+                f"devices, sql and cpu! (when checking arguments for {func}). Move the CPU "
+                "tensor with .to('sql')"
+            )
 
 
 def _requires_grad(args, kwargs) -> bool:
@@ -798,9 +842,11 @@ class _FunctionMode(TorchFunctionMode):
 
     def _to(self, args, kwargs):
         source = args[0]
-        # _parse_to doesn't take copy=.
+        # _parse_to doesn't take copy=. An outer environment's mode would
+        # take it, with device="sql", for a factory.
         parse = {k: v for k, v in kwargs.items() if k != "copy"}
-        device, dtype, _, _ = torch._C._nn._parse_to(*args[1:], **parse)
+        with torch._C.DisableTorchFunction():
+            device, dtype, _, _ = torch._C._nn._parse_to(*args[1:], **parse)
         if device is None or not is_sql(device):
             return None  # for a torch-sql tensor, dispatch: a cast, or a read
         if isinstance(source, Tensor):
