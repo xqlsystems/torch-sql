@@ -50,6 +50,3 @@ with torch_sql.Environment("duckdb"):
     y = mlp(torch.randn(4, 3, dtype=torch.float64, device="sql"))
     print(y)  # runs one SQL query on DuckDB
 ```
-
-Float32, PyTorch's default, works too; float64 makes any disagreement with
-PyTorch easy to see.
