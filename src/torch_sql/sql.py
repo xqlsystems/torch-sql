@@ -159,7 +159,9 @@ def expr(e: Expr, aliases: list[str], ieee: str | None = None, grouped: bool = F
     raise TypeError(f"not an expression: {e!r}")
 
 
-def cast_to(e: Expr, dtype: torch.dtype) -> Call:
+def cast_to(e: Expr, dtype: torch.dtype) -> Expr:
+    if dtype == torch.float32:
+        return real(e)
     return Call(f"cast:{SQL_TYPES[dtype]}", (e,))
 
 
@@ -217,11 +219,17 @@ _REAL_OVERFLOW = 3.4028235677973366e38
 def _to_real(e: Expr, node: Select) -> Expr:
     """``e`` cast to REAL. Each float32 op rounds its result to float32, as
     PyTorch's do; an engine computes some of it in DOUBLE (SUM and AVG of
-    REAL, and DuckDB's exp, ln and tanh). DuckDB raises on a DOUBLE past
-    REAL's range, where IEEE rounding, DataFusion and PyTorch give an
-    infinity, so a value that may be DOUBLE is rounded to one first."""
+    REAL, and DuckDB's exp, ln and tanh)."""
     if not _may_be_double(e, node):
         return Call("cast:REAL", (e,))
+    return real(e)
+
+
+def real(e: Expr) -> Expr:
+    """``e``, which may be DOUBLE, cast to REAL. DuckDB raises on a DOUBLE
+    past REAL's range, where IEEE rounding, DataFusion and PyTorch give an
+    infinity, so such a value is rounded to one first. Below that, DuckDB's
+    cast rounds as IEEE does."""
     big = Lit(_REAL_OVERFLOW, torch.float64)
     rounded = Call(
         "case",
@@ -255,7 +263,8 @@ def _may_be_double(e: Expr, node: Select) -> bool:
     for sub in walk(e):
         if isinstance(sub, Agg) or (isinstance(sub, Call) and sub.fn in FUNCTIONS):
             return True
-        if isinstance(sub, Lit) and sub.dtype == torch.float64:
+        if isinstance(sub, Lit) and (sub.dtype == torch.float64 or _nonfinite(sub)):
+            # An infinity or a NaN is read as DOUBLE, from IEEE.
             return True
         if isinstance(sub, Col) and node.inputs[sub.input].dtype == torch.float64:
             return True

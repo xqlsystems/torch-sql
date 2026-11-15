@@ -12,6 +12,8 @@ import torch
 
 aten = torch.ops.aten
 
+_CORE = torch._decomp.core_aten_decompositions()
+
 
 def var(x, dim=None, *, correction=None, keepdim=False):
     """``aten.var.correction``, which ``torch.var`` and ``torch.std`` call:
@@ -30,7 +32,24 @@ def var(x, dim=None, *, correction=None, keepdim=False):
     return (deviation * deviation).sum(dims, keepdim=keepdim) / max(n - correction, 0)
 
 
+def vector_norm(x, ord=2, dim=None, keepdim=False, *, dtype=None):
+    """``aten.linalg_vector_norm``. For the 2-norm, ``sqrt`` of the sum of
+    squares with a gradient of 0 where the norm is 0, as PyTorch's backward
+    gives, rather than ``sqrt``'s 0/0: ``F.normalize`` and
+    ``cosine_similarity`` of an all-zero row, such as padding, read it. The
+    other norms are PyTorch's decomposition."""
+    if ord != 2 or not x.is_floating_point():
+        return _CORE[aten.linalg_vector_norm.default](x, ord, dim, keepdim, dtype=dtype)
+    if dtype is not None:
+        x = x.to(dtype)
+    squares = (x * x).sum(dim if dim is not None else list(range(x.dim())), keepdim=keepdim)
+    zero = squares == 0
+    # sqrt only of what's positive, so neither branch's gradient is 0/0.
+    return squares.masked_fill(zero, 1.0).sqrt().masked_fill(zero, 0.0)
+
+
 #: The decompositions, by ATen op overload.
 DECOMPOSITIONS = {
     aten.var.correction: var,
+    aten.linalg_vector_norm.default: vector_norm,
 }

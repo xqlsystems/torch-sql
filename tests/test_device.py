@@ -824,3 +824,31 @@ def test_cosine_similarity_of_integers_and_of_large_vectors(env):
     s = small.detach().to("sql").requires_grad_()
     f(s, x[None].to("sql")).sum().backward()
     torch.testing.assert_close(s.grad.cpu(), small.grad)
+
+
+def test_float32_constants_and_casts_past_its_range(env):
+    # DuckDB raises on casting a DOUBLE past REAL's range, as a float32
+    # constant or a float64 value made float32 would be.
+    x = torch.tensor([1.0, -1.0, 2.0])
+    same(x.to("sql") * 1e39, x * 1e39)
+    d = torch.tensor([1e39, -1e40, 1.0], dtype=F64)
+    same(d.to("sql").float(), d.float())
+    same(d.to("sql").float() + 1, d.float() + 1)
+    target = torch.zeros(3).to("sql")
+    target.copy_(d.to("sql"))
+    same(target, d.float())
+
+
+def test_the_gradient_of_a_norm_at_zero(env):
+    # PyTorch's backward gives 0 where the norm is 0; sqrt's would be 0/0.
+    f = torch.nn.functional
+    for fn in (
+        lambda a: torch.linalg.vector_norm(a, dim=1).sum(),
+        lambda a: f.normalize(a, dim=1).sum(),
+        lambda a: f.cosine_similarity(a, torch.ones_like(a)).sum(),
+    ):
+        a = torch.tensor([[0.0, 0.0, 0.0], [1.0, 2.0, 2.0]], dtype=F64, requires_grad=True)
+        fn(a).backward()
+        s = a.detach().to("sql").requires_grad_()
+        fn(s).backward()
+        torch.testing.assert_close(s.grad.cpu(), a.grad, rtol=1e-12, atol=1e-12)
