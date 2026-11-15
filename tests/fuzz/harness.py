@@ -10,7 +10,7 @@ import os
 from contextlib import contextmanager
 
 import torch
-from fuzz_programs import F64, Program, Screens, leaf_tensors, output_of, run, scale
+from fuzz_programs import F32, F64, Program, Screens, leaf_tensors, output_of, run, scale
 from hypothesis import assume, event, note
 
 import torch_sql
@@ -22,15 +22,29 @@ from torch_sql import OperatorNotFound, engines
 #: expected (design §14).
 RTOL = 1e-9
 
+#: The same, by the program's dtype. Each float32 op rounds to float32, as
+#: PyTorch's do, but an engine computes a function or a sum in DOUBLE and
+#: rounds once, so the two differ by a few float32 roundings per step.
+TOLERANCE = {F64: RTOL, F32: 2e-5}
 
-def weights(shape) -> torch.Tensor:
+
+def weights(shape, dtype=F64) -> torch.Tensor:
     """Fixed, irregular weights for a scalar loss ``sum(out * w)``, so every
     element of the output gets its own cotangent."""
     n = math.prod(shape)
-    return torch.cos(torch.arange(n, dtype=F64) * 0.7 + 0.3).reshape(shape)
+    return torch.cos(torch.arange(n, dtype=F64) * 0.7 + 0.3).reshape(shape).to(dtype)
 
 
-def close(got: torch.Tensor, expected: torch.Tensor, scale_: float, what: str, *, inf_sign=True):
+def close(
+    got: torch.Tensor,
+    expected: torch.Tensor,
+    scale_: float,
+    what: str,
+    *,
+    inf_sign=True,
+    rtol=None,
+):
+    assert got.dtype == expected.dtype, f"{what}: dtype {got.dtype}, PyTorch's {expected.dtype}"
     got = got.detach().to(F64)
     expected = expected.detach().to(F64)
     assert got.shape == expected.shape, (
@@ -50,7 +64,7 @@ def close(got: torch.Tensor, expected: torch.Tensor, scale_: float, what: str, *
     )
     finite = ~(nan_exp | inf_exp)
     err = (got[finite] - expected[finite]).abs()
-    tol = RTOL * scale_
+    tol = (RTOL if rtol is None else rtol) * scale_
     assert not err.numel() or float(err.max()) <= tol, (
         f"{what}: off by {float(err.max()):.3g} (tolerance {tol:.3g})\n"
         f"got      {got.tolist()}\nexpected {expected.tolist()}"
@@ -120,7 +134,7 @@ def oracle(program: Program, *, grad: bool):
     grads = None
     if grad and values[output_of(program)].requires_grad:
         out = values[output_of(program)]
-        loss = (out * weights(out.shape)).sum()
+        loss = (out * weights(out.shape, out.dtype)).sum()
         grads = torch.autograd.grad(loss, leaves, allow_unused=True)
         grads = [
             torch.zeros_like(x) if g is None else g for x, g in zip(leaves, grads, strict=True)
@@ -144,10 +158,11 @@ def on_device(program: Program, engine: engines.Engine, *, grad: bool, read=(), 
             )
         grads = None
         if grad and out.requires_grad:
-            loss = (out * weights(out.shape).to("sql")).sum()
+            loss = (out * weights(out.shape, out.dtype).to("sql")).sum()
             loss.backward()
             grads = [
-                torch.zeros(x.shape, dtype=F64) if x.grad is None else x.grad.cpu() for x in leaves
+                torch.zeros(x.shape, dtype=x.dtype) if x.grad is None else x.grad.cpu()
+                for x in leaves
             ]
         value = out.detach().cpu()
     return value, grads
@@ -186,10 +201,11 @@ def check(program: Program, engine_name: str, *, grad: bool, budget="default", r
         got, grads = on_device(
             program, make_engine(engine_name, budget), grad=grad, read=read, requires=requires
         )
-    close(got, out, s, "value", inf_sign=not screens.zero_division)
+    rtol = TOLERANCE[program.dtype]
+    close(got, out, s, "value", inf_sign=not screens.zero_division, rtol=rtol)
     event("gradient compared" if grad else "value only")
     if grad:
         gs = scale([*expected_grads, *values])
         for k, (a, b) in enumerate(zip(grads, expected_grads, strict=True)):
-            close(a, b, gs, f"gradient of leaf {k}")
+            close(a, b, gs, f"gradient of leaf {k}", rtol=rtol)
     return grad
