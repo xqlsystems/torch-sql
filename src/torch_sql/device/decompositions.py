@@ -20,7 +20,15 @@ def var(x, dim=None, *, correction=None, keepdim=False):
     the mean of the squared distances from the mean, divided by ``n -
     correction`` rather than ``n``. Two passes, as ``layer_norm``'s
     variance is (§9.4), rather than ``AVG(x²) - AVG(x)²``, which loses
-    precision."""
+    precision. A float32 variance is computed in float64 and rounded once,
+    as PyTorch's CPU kernel accumulates it."""
+    return _variance(x, dim, correction, keepdim).to(x.dtype)
+
+
+def _variance(x, dim, correction, keepdim):
+    """The variance, in float64 for a float32 ``x``."""
+    if x.dtype == torch.float32:
+        x = x.double()
     if dim is None or (not isinstance(dim, int) and len(dim) == 0):
         dims = list(range(x.dim()))
     else:
@@ -37,9 +45,11 @@ def std(x, dim=None, *, correction=None, keepdim=False):
     the standard deviation is 0, as PyTorch's backward gives, rather than
     ``sqrt``'s 0/0. A constant feature in ``(x - x.mean(0)) / x.std(0)``
     would otherwise make every gradient NaN."""
-    v = var(x, dim, correction=correction, keepdim=keepdim)
+    v = _variance(x, dim, correction, keepdim)
     zero = v == 0
-    return v.masked_fill(zero, 1.0).sqrt().masked_fill(zero, 0.0)
+    # In float64 for a float32 x, as PyTorch: the variance of [-1e20, 1e20]
+    # passes float32's range, its square root doesn't.
+    return v.masked_fill(zero, 1.0).sqrt().masked_fill(zero, 0.0).to(x.dtype)
 
 
 def var_mean(x, dim=None, *, correction=None, keepdim=False):

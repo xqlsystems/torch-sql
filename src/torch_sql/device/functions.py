@@ -88,12 +88,21 @@ def _converted(x, index):
 
 
 def new_tensor(self, data, dtype=None, device=None, requires_grad=False, **kwargs):
-    """``x.new_tensor(data)``: a tensor of ``data`` on ``x``'s device, which
-    PyTorch's C++ would make on ``meta``."""
-    if device is not None and torch.device(device).type != "sql":
-        return torch.tensor(data, dtype=dtype or self.dtype, device=device)
-    cpu = torch.as_tensor(data, dtype=dtype or self.dtype).detach().clone()
-    return self._env.tensor(cpu).requires_grad_(requires_grad)
+    """``x.new_tensor(data)``: a copy of ``data`` with ``x``'s dtype and
+    device unless others are given. PyTorch's C++ would make it on
+    ``meta`` for a torch-sql ``x``."""
+    from .environment import Environment
+
+    dtype = dtype or self.dtype
+    device = torch.device(device) if device is not None else self.device
+    if isinstance(data, torch.Tensor):
+        cpu = data.detach().cpu().to(dtype).clone()
+    else:
+        cpu = torch.as_tensor(data, dtype=dtype, device="cpu").clone()
+    if device.type != "sql":
+        return cpu.to(device).requires_grad_(requires_grad)
+    env = getattr(self, "_env", None) or Environment.active()
+    return env.tensor(cpu).requires_grad_(requires_grad)
 
 
 def where(condition, input=None, other=None, **kwargs):
