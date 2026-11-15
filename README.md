@@ -22,6 +22,17 @@ the docs:
 - [docs/spikes/](docs/spikes/README.md): small programs that answer the
   design's open questions, with their results.
 
+## Install
+
+torch-sql is on PyPI, as an alpha. Install it with an engine, DuckDB or
+DataFusion, to run anything:
+
+```bash
+pip install "torch-sql[duckdb]"       # or torch-sql[datafusion], or both
+```
+
+It needs Python 3.12 or later and PyTorch 2.15 or later.
+
 ## Development
 
 torch-sql uses [uv](https://docs.astral.sh/uv/). From the repository root:
