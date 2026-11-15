@@ -80,6 +80,58 @@ def vector_norm(x, ord=2, dim=None, keepdim=False, *, dtype=None):
     return squares.masked_fill(zero, 1.0).sqrt().masked_fill(zero, 0.0)
 
 
+def log_sigmoid_forward(x):
+    """``aten.log_sigmoid_forward``, which ``F.logsigmoid`` and
+    ``binary_cross_entropy_with_logits`` call: ``min(x, 0) - log1p(exp(-|x|))``,
+    as PyTorch's decomposition, with both kinks taken on the same side of 0.
+    ``minimum`` and ``abs`` each have a kink at 0 whose derivatives cancel,
+    and ddx takes 0 for each, so the gradient at 0 came out 0 rather than
+    0.5. ``exp`` reads at most 0, so it never overflows. The buffer is
+    PyTorch's CPU one, ``exp(-|x|)``."""
+    positive = x >= 0
+    zero = torch.zeros_like(x)
+    z = torch.exp(torch.where(positive, -x, x))
+    return torch.where(positive, zero, x) - torch.log1p(z), z
+
+
+def softplus(x, beta=1, threshold=20):
+    """``aten.softplus``: ``x`` past the threshold, ``log1p(exp(x * beta)) /
+    beta`` below it, as PyTorch's decomposition. ``exp`` reads at most the
+    threshold, so the branch not taken never overflows: its gradient was
+    inf / inf, which ``where`` turned into NaN, past exp's range. ``mish``
+    calls it too."""
+    scaled = x * beta
+    above = scaled > threshold
+    inner = torch.where(above, torch.full_like(scaled, threshold), scaled)
+    return torch.where(above, x, torch.log1p(torch.exp(inner)) / beta)
+
+
+#: The least ``p * (1 - p)`` that PyTorch's backward of
+#: ``binary_cross_entropy`` divides by.
+_BCE_EPSILON = 1e-12
+
+
+def binary_cross_entropy(p, target, weight=None, reduction=1):
+    """``aten.binary_cross_entropy``, with PyTorch's gradient rather than the
+    derivative of its forward. PyTorch's backward is ``(p - y) / max(p * (1 -
+    p), 1e-12)``, which flattens once ``p`` is within about 1e-12 of 0 or 1,
+    where the forward's clamped logs keep a slope; ``sigmoid`` saturates
+    there, so the two trainings would part. The forward is PyTorch's,
+    computed from a detached ``p``, plus ``(p - p.detach())`` times the
+    detached gradient: that is 0, and its gradient is PyTorch's. ``target``
+    and ``weight`` get the forward's gradient, as in PyTorch."""
+    q = p.detach()
+    loss = _CORE[aten.binary_cross_entropy.default](q, target, weight, 0)
+    y = target.detach()
+    slope = (q - y) / ((1 - q) * q).clamp_min(_BCE_EPSILON)
+    if weight is not None:
+        slope = slope * weight.detach()
+    loss = loss + (p - q) * slope
+    if reduction == 1:
+        return loss.mean()
+    return loss.sum() if reduction == 2 else loss
+
+
 #: The decompositions, by ATen op overload.
 DECOMPOSITIONS = {
     aten.var.correction: var,
@@ -87,4 +139,7 @@ DECOMPOSITIONS = {
     aten.var_mean.correction: var_mean,
     aten.std_mean.correction: std_mean,
     aten.linalg_vector_norm.default: vector_norm,
+    aten.log_sigmoid_forward.default: log_sigmoid_forward,
+    aten.softplus.default: softplus,
+    aten.binary_cross_entropy.default: binary_cross_entropy,
 }

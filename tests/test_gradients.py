@@ -641,3 +641,114 @@ def test_gradient_of_clamp_at_its_bounds(env, clamp):
     s = x.detach().to("sql").requires_grad_()
     clamp(s.clone()).sum().backward()
     torch.testing.assert_close(s.grad.cpu(), x.grad)
+
+
+# -- Found by the adversary's second review of #29 ---------------------------
+
+F = torch.nn.functional
+
+#: (loss, input, dtype). Each gradient differed from PyTorch's, or raised.
+EXTREMES = {
+    # A logit of exactly 0: the kinks of minimum and abs at 0 cancel in
+    # PyTorch's decomposition, and ddx took 0 for each.
+    "bce-with-logits-at-0": (
+        lambda x: F.binary_cross_entropy_with_logits(x, torch.full_like(x, 0.3)),
+        [0.0, 1.0, -2.0],
+        F64,
+    ),
+    "logsigmoid": (lambda x: F.logsigmoid(x).sum(), [0.0, 800.0, -800.0, -3.0], F64),
+    "logsigmoid-float32": (lambda x: F.logsigmoid(x).sum(), [0.0, 100.0, -100.0], torch.float32),
+    # The branch past the threshold overflowed exp, and where turned its
+    # gradient into NaN.
+    "softplus": (lambda x: F.softplus(x).sum(), [800.0, 1.0, 25.0, -800.0], F64),
+    "softplus-float32": (lambda x: F.softplus(x).sum(), [100.0, 1.0, 19.0], torch.float32),
+    "softplus-beta": (lambda x: F.softplus(x, beta=2, threshold=5).sum(), [800.0, 1.0, 2.0], F64),
+    "mish": (lambda x: F.mish(x).sum(), [800.0, 1.0, -800.0], F64),
+    # Issue #35: 1 / (1 + exp(-v)) has a gradient of inf / inf below -709.
+    "sigmoid": (lambda x: torch.sigmoid(x).sum(), [-800.0, 800.0, 0.0, -3.0], F64),
+    "sigmoid-float32": (lambda x: torch.sigmoid(x).sum(), [-100.0, 100.0, 0.0], torch.float32),
+    "silu": (lambda x: F.silu(x).sum(), [-800.0, 800.0, 0.0, -3.0], F64),
+    # Rounding a float32 result to an infinity gave it a gradient of 0,
+    # which the sum passed to every element.
+    "float32-overflow-mul": (lambda x: (x * 1e38).sum(), [3.0, 4.0], torch.float32),
+    "float32-overflow-exp": (lambda x: x.exp().sum(), [88.0, 88.5, 1.0], torch.float32),
+    # log's constant -inf at 0 had a gradient of 0; PyTorch's is 1/0.
+    "log-at-0": (lambda x: x.log().sum(), [0.0, 0.5], F64),
+    "log-at-0-float32": (lambda x: x.log().sum(), [0.0, 0.5], torch.float32),
+    # PyTorch's backward divides by max(p * (1 - p), 1e-12), which
+    # flattens a saturated probability's gradient.
+    "bce-saturated": (
+        lambda x: F.binary_cross_entropy(torch.sigmoid(x), torch.full_like(x, 0.3)),
+        [-50.0, 0.5, 2.0],
+        F64,
+    ),
+    "bce-weighted-sum": (
+        lambda x: F.binary_cross_entropy(
+            torch.sigmoid(x),
+            torch.tensor([0.0, 1.0, 0.3], dtype=x.dtype, device=x.device),
+            weight=torch.tensor([2.0, 1.0, 0.5], dtype=x.dtype, device=x.device),
+            reduction="sum",
+        ),
+        [-50.0, 0.5, 2.0],
+        F64,
+    ),
+    "bce-float32": (
+        lambda x: F.binary_cross_entropy(torch.sigmoid(x), torch.ones_like(x)),
+        [-20.0, 0.5, 3.0],
+        torch.float32,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(EXTREMES))
+def test_gradient_at_extremes(env, case):
+    loss, values, dtype = EXTREMES[case]
+    x = torch.tensor(values, dtype=dtype, requires_grad=True)
+    expected = loss(x)
+    expected.backward()
+    s = torch.tensor(values, dtype=dtype, device="sql", requires_grad=True)
+    got = loss(s)
+    got.backward()
+    tol = 1e-12 if dtype == F64 else 1e-6
+    torch.testing.assert_close(got.detach().cpu(), expected.detach(), rtol=tol, atol=tol)
+    torch.testing.assert_close(s.grad.cpu(), x.grad, rtol=tol, atol=tol)
+
+
+def test_bce_gradient_reaches_its_target(env):
+    # The target gets the forward's gradient, as PyTorch's
+    # binary_cross_entropy_target_backward gives.
+    p = torch.tensor([0.2, 0.9], dtype=F64)
+    y = torch.tensor([0.3, 0.6], dtype=F64, requires_grad=True)
+    F.binary_cross_entropy(p, y).backward()
+    t = y.detach().to("sql").requires_grad_()
+    F.binary_cross_entropy(p.to("sql"), t).backward()
+    close(t.grad, y.grad)
+
+
+def test_zero_initialized_classifier_head(env):
+    # A head with zeroed weights gives logits of exactly 0. Its bias
+    # gradient was 0.75 rather than 0.25.
+    torch.manual_seed(0)
+    head = torch.nn.Linear(4, 1).double()
+    torch.nn.init.zeros_(head.weight)
+    torch.nn.init.zeros_(head.bias)
+    x, y = torch.randn(3, 4, dtype=F64), torch.tensor([[1.0], [0.0], [1.0]], dtype=F64)
+    F.binary_cross_entropy_with_logits(head(x), y).backward()
+    sql_head = torch.nn.Linear(4, 1).double()
+    sql_head.load_state_dict(head.state_dict())
+    sql_head.to("sql")
+    F.binary_cross_entropy_with_logits(sql_head(x.to("sql")), y.to("sql")).backward()
+    close(sql_head.bias.grad, head.bias.grad)
+    close(sql_head.weight.grad, head.weight.grad)
+
+
+def test_float32_gradient_past_its_range(env, request):
+    # 1e-30 is a normal float32, and 1/x's gradient there, -1e60, rounds to
+    # -inf. On DuckDB, ddx casts its DOUBLE gradient to REAL, which raises.
+    if "duckdb" in request.node.callspec.id:
+        request.applymarker(pytest.mark.xfail(strict=True, reason="xqlsystems/ddx#272"))
+    x = torch.tensor([1e-30, 1.0], requires_grad=True)
+    x.reciprocal().sum().backward()
+    s = x.detach().to("sql").requires_grad_()
+    s.reciprocal().sum().backward()
+    torch.testing.assert_close(s.grad.cpu(), x.grad)
