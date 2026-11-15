@@ -5,7 +5,10 @@ the same there (P1). Where the two engines read a construct differently,
 the writer picks a spelling both read alike:
 
 - a float literal is written with an exponent (``0.5e0``), which both read
-  as DOUBLE; DuckDB reads ``0.5`` as a DECIMAL;
+  as DOUBLE; DuckDB reads ``0.5`` as a DECIMAL. A float32 one is cast to
+  REAL, as PyTorch converts a number to float32 for a float32 op;
+- a float32 value is cast to REAL where it's computed, since the engines
+  give some functions and aggregates of REAL as DOUBLE, and differ on which;
 - infinities and NaN are read from a one-row table every engine registers,
   :data:`IEEE`, since ddx refuses to differentiate a query that holds a
   non-finite literal (xqlsystems/ddx#261). Outside a ``SELECT`` that a
@@ -107,12 +110,14 @@ def literal(value, dtype: torch.dtype) -> str:
     if dtype == torch.int64:
         return str(int(value))
     value = float(value)
+    sql_type = SQL_TYPES[dtype]
     if math.isnan(value):
-        return "CAST('NaN' AS DOUBLE)"
+        return f"CAST('NaN' AS {sql_type})"
     if math.isinf(value):
-        return f"CAST('{'-' if value < 0 else ''}inf' AS DOUBLE)"
+        return f"CAST('{'-' if value < 0 else ''}inf' AS {sql_type})"
     s = repr(value)
-    return s if "e" in s else f"{s}e0"
+    s = s if "e" in s else f"{s}e0"
+    return s if dtype == torch.float64 else f"CAST({s} AS {sql_type})"
 
 
 def expr(e: Expr, aliases: list[str], ieee: str | None = None, grouped: bool = False) -> str:
@@ -187,7 +192,13 @@ def select(node: Select, resolve=lambda n: n) -> str:
         f"{expr(e, aliases, ieee, grouped)} AS {c}"
         for e, c in zip(node.index, node.columns, strict=True)
     ]
-    cols.append(f"{expr(node.value, aliases, ieee, grouped)} AS v")
+    value = expr(node.value, aliases, ieee, grouped)
+    if node.dtype == torch.float32 and not _reads_real(node):
+        # Each float32 op rounds its result to float32, as PyTorch's do. An
+        # engine computes some of it in DOUBLE: SUM and AVG of REAL, and
+        # DuckDB's exp, ln and tanh.
+        value = f"CAST({value} AS REAL)"
+    cols.append(f"{value} AS v")
     sql = f"SELECT {', '.join(cols)}"
     if parts:
         sql += f" FROM {' '.join(parts)}"
@@ -199,6 +210,12 @@ def select(node: Select, resolve=lambda n: n) -> str:
     if node.group and keys:
         sql += f" GROUP BY {', '.join(keys)}"
     return sql
+
+
+def _reads_real(node: Select) -> bool:
+    """Whether ``node``'s value is a float32 column of an input as it is."""
+    v = node.value
+    return isinstance(v, Col) and node.inputs[v.input].dtype == torch.float32
 
 
 def _cols(e: Expr):

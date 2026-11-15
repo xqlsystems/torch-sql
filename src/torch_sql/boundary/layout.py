@@ -20,6 +20,7 @@ from ..graph import check_dtype, index_columns
 
 _ARROW = {
     torch.float64: pa.float64(),
+    torch.float32: pa.float32(),
     torch.int64: pa.int64(),
     torch.bool: pa.bool_(),
 }

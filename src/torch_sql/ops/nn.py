@@ -16,7 +16,6 @@ from . import op
 from ._build import elementwise, normalize_dims, scalar
 
 aten = torch.ops.aten
-F64 = torch.float64
 
 
 def grouped(x: g.Node, dims, agg: str, value=None) -> g.Select:
@@ -81,10 +80,14 @@ def native_layer_norm(ctx, x, normalized_shape, weight, bias, eps):
     dims = set(range(x.rank - len(normalized_shape), x.rank))
     ctx.env.marked_cuts.add(x)  # a norm reads its input three times (D15)
     mean = grouped(x, dims, "AVG")
-    centered = elementwise(x.shape, F64, [x, mean], lambda v, m: v - m)
+    dtype = x.dtype
+    centered = elementwise(x.shape, dtype, [x, mean], lambda v, m: v - m)
     var = grouped(centered, dims, "AVG", g.Col(0, "v") * g.Col(0, "v"))
     rstd = elementwise(
-        var.shape, F64, [var], lambda v: scalar(1.0, F64) / g.call("sqrt", v + scalar(eps, F64))
+        var.shape,
+        dtype,
+        [var],
+        lambda v: scalar(1.0, dtype) / g.call("sqrt", v + scalar(eps, dtype)),
     )
     operands = [centered, rstd] + [t for t in (weight, bias) if t is not None]
 
@@ -97,7 +100,7 @@ def native_layer_norm(ctx, x, normalized_shape, weight, bias, eps):
             y = y + affine.pop(0)
         return y
 
-    return elementwise(x.shape, F64, operands, fn), mean, rstd
+    return elementwise(x.shape, dtype, operands, fn), mean, rstd
 
 
 @op(aten._softmax.default)
@@ -109,9 +112,9 @@ def softmax(ctx, x, dim, half_to_float):
     (:mod:`.reductions`). ``log_softmax`` is the same."""
     dims = set(normalize_dims(dim, x.rank))
     m = grouped(x, dims, "MAX")
-    e = elementwise(x.shape, F64, [x, m], lambda v, mx: g.call("exp", v - mx))
+    e = elementwise(x.shape, x.dtype, [x, m], lambda v, mx: g.call("exp", v - mx))
     s = grouped(e, dims, "SUM")
-    return elementwise(x.shape, F64, [e, s], lambda v, t: v / t)
+    return elementwise(x.shape, x.dtype, [e, s], lambda v, t: v / t)
 
 
 @op(aten._log_softmax.default)
@@ -120,9 +123,9 @@ def log_softmax(ctx, x, dim, half_to_float):
     least 1, so ``ln`` needs no guard."""
     dims = set(normalize_dims(dim, x.rank))
     m = grouped(x, dims, "MAX")
-    shifted = elementwise(x.shape, F64, [x, m], lambda v, mx: v - mx)
+    shifted = elementwise(x.shape, x.dtype, [x, m], lambda v, mx: v - mx)
     s = grouped(shifted, dims, "SUM", g.call("exp", g.Col(0, "v")))
-    return elementwise(x.shape, F64, [shifted, s], lambda v, t: v - g.call("ln", t))
+    return elementwise(x.shape, x.dtype, [shifted, s], lambda v, t: v - g.call("ln", t))
 
 
 @op(aten.native_dropout.default)
@@ -139,8 +142,13 @@ def native_dropout(ctx, x, p, train):
     keep = 1.0 - p
     scale = 0.0 if keep == 0 else 1.0 / keep
     mask = ctx.env.upload(torch.empty(tuple(x.shape), dtype=torch.bool).bernoulli_(keep))
+    dtype = x.dtype
     y = elementwise(
-        x.shape, F64, [x, mask], lambda v, k: v * k * scalar(scale, F64), compute=[F64, F64]
+        x.shape,
+        dtype,
+        [x, mask],
+        lambda v, k: v * k * scalar(scale, dtype),
+        compute=[dtype, dtype],
     )
     return y, mask
 

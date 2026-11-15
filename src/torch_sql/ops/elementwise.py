@@ -31,7 +31,7 @@ from . import Context, op
 from ._build import elementwise, python_dtype, scalar
 
 aten = torch.ops.aten
-FLOATS = (torch.float64,)
+FLOATS = (torch.float64, torch.float32)
 
 NAN = g.Lit(math.nan, torch.float64)
 NEG_INF = g.Lit(-math.inf, torch.float64)
@@ -99,10 +99,9 @@ def compare(cmp: str, a: g.Expr, b: g.Expr, floating: bool) -> g.Expr:
 
 def comparison_dtype(ctx: Context, a, b) -> torch.dtype:
     """The dtype PyTorch compares ``a`` and ``b`` in. For an integer tensor
-    against a Python float, PyTorch compares in the default float dtype,
-    float32; torch-sql compares in float64, which it supports, and which
-    agrees with float32 except for integers beyond 2**24 that float32 can't
-    tell apart."""
+    against a Python float, it's the default float dtype, float32 unless
+    ``torch.set_default_dtype`` says otherwise, which can't tell apart
+    integers beyond 2**24."""
 
     def meta(x):
         if isinstance(x, g.Node):
@@ -110,8 +109,7 @@ def comparison_dtype(ctx: Context, a, b) -> torch.dtype:
         return x
 
     with torch._C.DisableTorchFunction():
-        dtype = torch.result_type(meta(a), meta(b))
-    return torch.float64 if dtype.is_floating_point else dtype
+        return torch.result_type(meta(a), meta(b))
 
 
 # ----------------------------------------------------------------------------

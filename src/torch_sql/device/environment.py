@@ -333,7 +333,7 @@ class Environment:
             where=g.Lit(False, torch.bool),
             index=tuple(g.Lit(0, torch.int64) for _ in shape),
             value=g.Lit(0 if dtype != torch.bool else False, dtype)
-            if dtype != torch.float64
+            if not dtype.is_floating_point
             else g.Lit(0.0, dtype),
         )
 
@@ -541,7 +541,7 @@ def _stopped(nodes):
     a gradient: constants to the loss, as in PyTorch (§11.3)."""
     return tree_map(
         lambda n: g.identity(n, stop_gradient=True)
-        if isinstance(n, g.Node) and n.dtype == torch.float64
+        if isinstance(n, g.Node) and n.dtype.is_floating_point
         else n,
         nodes,
     )

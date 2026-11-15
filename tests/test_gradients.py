@@ -374,25 +374,28 @@ DIFFERENTIABLE = [
 ]
 
 
+@pytest.mark.parametrize("dtype", [F64, torch.float32], ids=["float64", "float32"])
 @pytest.mark.parametrize(
     "info",
     [o for o in op_db if o.name in DIFFERENTIABLE],
     ids=lambda o: f"{o.name}.{o.variant_test_name}".strip("."),
 )
-def test_op_gradient(engine, info):
+def test_op_gradient(engine, info, dtype):
     """For each sample: the gradient of sum(op(x) * c), for a fixed random c,
-    with respect to every float input, matches PyTorch's autograd."""
-    if F64 not in info.dtypes:
-        pytest.skip("no float64 variant")
+    with respect to every float input, matches PyTorch's autograd, in
+    float64 to 1e-10 and in float32 to 1e-4."""
+    if dtype not in info.dtypes:
+        pytest.skip(f"no {dtype} variant")
     env = torch_sql.Environment(engine)
+    tolerance = 1e-10 if dtype == F64 else 1e-4
     ran = refused = 0
-    for sample in info.sample_inputs("cpu", F64, requires_grad=True):
+    for sample in info.sample_inputs("cpu", dtype, requires_grad=True):
         tensors = [
             t
             for t in tree_flatten((sample.input, sample.args, sample.kwargs))[0]
             if isinstance(t, torch.Tensor)
         ]
-        if any(t.dtype not in (F64, torch.int64, torch.bool) for t in tensors):
+        if any(t.dtype not in (dtype, torch.int64, torch.bool) for t in tensors):
             continue
         if sample.kwargs.get("dropout_p"):  # random, so it can't match PyTorch
             continue
@@ -469,7 +472,11 @@ def test_op_gradient(engine, info):
                 assert got is None or not got.cpu().any()
             else:
                 torch.testing.assert_close(
-                    got.cpu(), e, rtol=1e-10, atol=1e-10, msg=lambda m, s=sample: f"{s}\n{m}"
+                    got.cpu(),
+                    e,
+                    rtol=tolerance,
+                    atol=tolerance,
+                    msg=lambda m, s=sample: f"{s}\n{m}",
                 )
         ran += 1
     if not ran:

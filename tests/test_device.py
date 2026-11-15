@@ -311,16 +311,17 @@ def test_cpu_tensors_beside_sql_ones(env):
         x + torch.ones(2, dtype=F64)
 
 
-def test_true_division_of_integers_is_refused(env):
-    # PyTorch gives float32, which torch-sql doesn't support yet (§8.2).
-    a = torch.arange(1, 4, device="sql")
-    with pytest.raises(NotImplementedError, match="float32"):
-        a / a
+def test_true_division_of_integers(env):
+    # PyTorch gives the default dtype, float32.
+    a = torch.arange(1, 4)
+    got = a.to("sql") / 2
+    assert got.dtype == torch.float32
+    same(got, a / 2)
 
 
 def test_unsupported_dtype_is_refused(env):
-    with pytest.raises(NotImplementedError, match="float32"):
-        torch.ones(2, device="sql")
+    with pytest.raises(NotImplementedError, match="bfloat16"):
+        torch.ones(2, dtype=torch.bfloat16, device="sql")
 
 
 def test_exact_gelu_is_refused(env):
@@ -669,9 +670,9 @@ def test_a_cpu_tensor_beside_a_torch_sql_one(env):
     )
 
 
-def test_float32_refusal_says_what_to_do(env):
-    with pytest.raises(NotImplementedError, match="set_default_dtype"):
-        torch.nn.Linear(2, 1).to("sql")
+def test_half_precision_refusal_says_what_to_do(env):
+    with pytest.raises(NotImplementedError, match="float"):
+        torch.nn.Linear(2, 1).half().to("sql")
 
 
 def test_format_of_a_scalar(env):

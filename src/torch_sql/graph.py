@@ -32,10 +32,10 @@ from typing import Any
 import torch
 
 #: The dtypes a value column may have, and their SQL types. float64 is the
-#: default for verification (§8.2). float32 is planned; until it lands,
-#: torch-sql refuses it rather than computing in a different precision.
+#: default for verification (§8.2); float32 is ``REAL`` on both engines.
 SQL_TYPES = {
     torch.float64: "DOUBLE",
+    torch.float32: "REAL",
     torch.int64: "BIGINT",
     torch.bool: "BOOLEAN",
 }
@@ -55,11 +55,8 @@ def index_columns(rank: int) -> tuple[str, ...]:
 def check_dtype(dtype: torch.dtype) -> None:
     if dtype not in SQL_TYPES:
         hint = ""
-        if dtype == torch.float32:
-            hint = (
-                ". PyTorch's default dtype is float32: call torch.set_default_dtype("
-                "torch.float64) first, or .double() on the model and its inputs"
-            )
+        if dtype in (torch.float16, torch.bfloat16):
+            hint = ". Neither SQL engine has it; .float() or .double() the model and its inputs"
         raise NotImplementedError(
             f"torch-sql doesn't support {dtype} yet; it supports "
             f"{', '.join(str(d) for d in SQL_TYPES)} (design §8.2){hint}"
@@ -112,7 +109,7 @@ class Col(Expr):
 @dataclass(frozen=True, slots=True)
 class Lit(Expr):
     """A constant. Floats are written so that every engine reads them as
-    DOUBLE, with the same bits."""
+    DOUBLE, with the same bits, or as REAL for a float32 constant."""
 
     value: Any
     dtype: torch.dtype

@@ -127,16 +127,30 @@ def to_sql(env, x):
     return env.tensor(x) if isinstance(x, torch.Tensor) else x
 
 
+#: The tolerances of each float dtype: float64's are tight, to see any
+#: disagreement; float32's are PyTorch's defaults for it. torch-sql computes
+#: some float32 ops in DOUBLE and rounds the result once, where PyTorch's
+#: CPU kernels compute in float32, so the two differ by rounding.
+TOLERANCE = {F64: 1e-12, torch.float32: None}
+
+#: float32 tolerances for ops whose results the two compute in different
+#: orders: attention's softmax of large scores. Each is as far from the
+#: float64 result as PyTorch's float32 is (1.7e-5), in another direction.
+FLOAT32_TOLERANCE = {"nn.functional.scaled_dot_product_attention": 5e-5}
+
+
+@pytest.mark.parametrize("dtype", [F64, torch.float32], ids=["float64", "float32"])
 @pytest.mark.parametrize("info", CASES, ids=lambda o: f"{o.name}.{o.variant_test_name}".strip("."))
-def test_op(engine, info):
+def test_op(engine, info, dtype):
     env = torch_sql.Environment(engine)
-    dtype = F64 if F64 in info.dtypes else (torch.int64 if torch.int64 in info.dtypes else None)
-    if dtype is None:
-        pytest.skip("no float64 or int64 variant")
+    if dtype not in info.dtypes:
+        if dtype != F64 or torch.int64 not in info.dtypes:
+            pytest.skip(f"no {dtype} variant")
+        dtype = torch.int64
     ran = refused = 0
     for sample in info.sample_inputs("cpu", dtype, requires_grad=False):
         if any(
-            isinstance(t, torch.Tensor) and t.dtype not in (F64, torch.int64, torch.bool)
+            isinstance(t, torch.Tensor) and t.dtype not in (dtype, torch.int64, torch.bool)
             for t in torch.utils._pytree.tree_leaves((sample.input, sample.args, sample.kwargs))
         ):
             continue
@@ -152,11 +166,14 @@ def test_op(engine, info):
                 refused += 1
                 continue
             got = tree_map(lambda x: x.cpu() if isinstance(x, torch_sql.Tensor) else x, got)
+        tolerance = TOLERANCE.get(dtype, 1e-12)
+        if dtype == torch.float32:
+            tolerance = FLOAT32_TOLERANCE.get(info.name)
         torch.testing.assert_close(
             got,
             expected,
-            rtol=1e-12,
-            atol=1e-12,
+            rtol=tolerance,
+            atol=tolerance,
             equal_nan=True,
             msg=lambda m, s=sample: f"{s}\n{m}",
         )
