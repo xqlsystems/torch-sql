@@ -620,3 +620,24 @@ def test_foreach_write_to_two_aliases_is_refused(env):
     with pytest.raises(NotImplementedError, match="share storage"):
         torch._foreach_maximum_([y, y.detach()], [w, c])
     assert y.cpu().tolist() == [0.0, 0.0, 0.0]
+
+
+@pytest.mark.parametrize(
+    "clamp",
+    [
+        lambda c: c.clamp(-0.4321, 0.7654),
+        lambda c: c.clamp_(-0.4321, 0.7654),
+        lambda c: c.clamp_min_(0.7654),
+        lambda c: c.clamp_max(-0.4321),
+    ],
+    ids=["clamp", "clamp_", "clamp_min_", "clamp_max"],
+)
+def test_gradient_of_clamp_at_its_bounds(env, clamp):
+    # PyTorch gives an element at a bound no gradient. The alias fuzzer
+    # found this: a clamp_ under no_grad left a value at the bound, and a
+    # later clamp_ of its clone passed it a gradient PyTorch doesn't.
+    x = torch.tensor([0.7654, 0.5, 0.9, -0.4321, -1.0], dtype=F64, requires_grad=True)
+    clamp(x.clone()).sum().backward()
+    s = x.detach().to("sql").requires_grad_()
+    clamp(s.clone()).sum().backward()
+    torch.testing.assert_close(s.grad.cpu(), x.grad)

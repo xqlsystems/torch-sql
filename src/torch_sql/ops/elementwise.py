@@ -384,11 +384,13 @@ def clamp(ctx, x, min=None, max=None):
         lo = bounds.pop(0) if min is not None else None
         hi = bounds.pop(0) if max is not None else None
         # min(max(v, lo), hi), as PyTorch computes it: hi wins when lo > hi.
+        # At a bound the value is the bound's, which gets the gradient, as
+        # PyTorch's clamp gives v none there.
         out = v
         if lo is not None:
-            out = case(g.call("<", out, lo), lo, out)
+            out = case(g.call("<=", out, lo), lo, out)
         if hi is not None:
-            out = case(g.call(">", out, hi), hi, out)
+            out = case(g.call(">=", out, hi), hi, out)
         if dt in FLOATS:
             nan = any_of(isnan(v), *(isnan(b) for b in (lo, hi) if b is not None))
             out = case(nan, NAN, out)
