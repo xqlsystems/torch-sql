@@ -1,0 +1,96 @@
+name: Publish to PyPI
+
+# Pushing a tag v<version>, such as v0.1.0rc1, builds the sdist and the wheel,
+# checks that the tag matches the version in pyproject.toml, installs the
+# wheel in a clean environment and runs the README's example on both engines,
+# then publishes to PyPI.
+#
+# Publishing uses PyPI's trusted publishing: PyPI trusts this workflow, in the
+# `pypi` environment, to publish torch-sql, so the repository stores no API
+# token.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Check the tag matches the version
+        run: |
+          version=$(uv version --short)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "The tag $GITHUB_REF_NAME doesn't match the version $version in pyproject.toml"
+            exit 1
+          fi
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  verify:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: astral-sh/setup-uv@v6
+      # The wheel alone, outside the repository, with PyTorch's CPU build.
+      - name: Install the wheel with both engines
+        run: |
+          uv venv --python 3.12 /tmp/env
+          wheel=$(ls dist/*.whl)
+          uv pip install --python /tmp/env "$wheel[duckdb,datafusion]" \
+            --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+      - name: Run the README's example, and a training step, on each engine
+        working-directory: /tmp
+        run: |
+          /tmp/env/bin/python - <<'EOF'
+          import torch, torch_sql
+
+          for engine in ("duckdb", "datafusion"):
+              with torch_sql.Environment(engine):
+                  torch.manual_seed(0)
+                  mlp = torch.nn.Sequential(
+                      torch.nn.Linear(3, 5), torch.nn.Tanh(), torch.nn.Linear(5, 2)
+                  ).double()
+                  reference = torch.nn.Sequential(
+                      torch.nn.Linear(3, 5), torch.nn.Tanh(), torch.nn.Linear(5, 2)
+                  ).double()
+                  reference.load_state_dict(mlp.state_dict())
+                  mlp = mlp.to("sql")
+                  x = torch.randn(4, 3, dtype=torch.float64)
+                  for model, data in ((mlp, x.to("sql")), (reference, x)):
+                      opt = torch.optim.SGD(model.parameters(), lr=0.1)
+                      model(data).square().sum().backward()
+                      opt.step()
+                  for p, q in zip(mlp.parameters(), reference.parameters()):
+                      torch.testing.assert_close(p.cpu(), q.detach())
+              print(engine, "ok")
+          EOF
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/torch-sql
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
