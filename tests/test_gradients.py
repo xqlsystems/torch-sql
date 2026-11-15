@@ -769,12 +769,32 @@ def test_zero_initialized_classifier_head(env):
     ],
     ids=["reciprocal", "exp"],
 )
-def test_float32_gradient_past_its_range(env, request, loss, values):
-    # On DuckDB, ddx casts its DOUBLE gradient to REAL, which raises.
-    if "duckdb" in request.node.callspec.id:
-        request.applymarker(pytest.mark.xfail(strict=True, reason="xqlsystems/ddx#272"))
+def test_float32_gradient_past_its_range(env, loss, values):
+    # On DuckDB, ddx cast its DOUBLE gradient to REAL, which raised past
+    # REAL's range until ddxdb 0.4.9 (xqlsystems/ddx#272).
     x = torch.tensor(values, requires_grad=True)
     loss(x).backward()
     s = x.detach().to("sql").requires_grad_()
     loss(s).backward()
     torch.testing.assert_close(s.grad.cpu(), x.grad)
+
+
+# -- Found by CodeRabbit's fourth review of #29 -------------------------------
+
+
+def test_float32_cast_keeps_negative_zero(env):
+    # real()'s offset was +0.0, and -0.0 + 0.0 is +0.0, so 1 / x gave +inf.
+    x = torch.tensor([-0.0, 0.0, 2.0], dtype=F64)
+    expected = 1 / x.float()
+    got = 1 / x.to("sql").float()
+    torch.testing.assert_close(got.cpu(), expected)
+    assert torch.equal(got.cpu().signbit(), expected.signbit())
+
+
+def test_gradient_of_log1p_at_minus_one(env):
+    # log1p's constant -inf at -1 had a gradient of 0; PyTorch's is 1/0.
+    x = torch.tensor([-1.0, 0.5, 3.0], dtype=F64, requires_grad=True)
+    x.log1p().sum().backward()
+    s = x.detach().to("sql").requires_grad_()
+    s.log1p().sum().backward()
+    close(s.grad, x.grad)

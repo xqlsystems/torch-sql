@@ -238,7 +238,7 @@ def real(e: Expr) -> Expr:
     ``e``'s gradient passes through unchanged, as PyTorch's does through a
     rounding to infinity: a constant in its place had a gradient of 0, which
     reached every element of a sum that overflowed. A NaN compares false and
-    adds 0."""
+    adds -0."""
     big = Lit(_REAL_OVERFLOW, torch.float64)
     offset = Call(
         "case",
@@ -250,7 +250,8 @@ def real(e: Expr) -> Expr:
                 (
                     Call("<=", (e, Lit(-_REAL_OVERFLOW, torch.float64))),
                     Lit(-math.inf, torch.float64),
-                    Lit(0.0, torch.float64),
+                    # -0.0, which keeps the sign of a -0.0: 0.0 + -0.0 is 0.0.
+                    Lit(-0.0, torch.float64),
                 ),
             ),
         ),

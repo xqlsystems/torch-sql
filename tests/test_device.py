@@ -907,6 +907,13 @@ def test_cosine_similarity_dtypes(env):
         f(i.to("sql"), i.to("sql"))
     a, b = torch.tensor([[1.0, 2.0]]), torch.tensor([[3.0, 1.0]], dtype=F64)
     same(f(a.to("sql"), b.to("sql")), f(a, b))
+    # A float64 scalar against a float32 vector, broadcast: float64, as in
+    # PyTorch, not narrowed to the vector's float32.
+    s, v = torch.tensor(1.0, dtype=F64), torch.tensor([1.0, 2.0])
+    expected = f(s, v, dim=0)
+    got = f(s.to("sql"), v.to("sql"), dim=0)
+    assert got.dtype == expected.dtype == F64
+    same(got, expected)
 
 
 def test_a_list_of_bools_as_an_index_is_refused_clearly(env):

@@ -240,7 +240,11 @@ def log1p(ctx, x):
         one, zero = scalar(1.0, ctx.out.dtype), scalar(0.0, ctx.out.dtype)
         u = one + v
         small = case(g.call("=", u, one), v, v * g.call("ln", u) / (u - one))
-        ln = case(g.call(">", u, zero), g.call("ln", u), case(g.call("=", u, zero), NEG_INF, NAN))
+        # At -1, -inf with a gradient of +inf, as log's at 0.
+        at_minus_one = NEG_INF * (one - v)
+        ln = case(
+            g.call(">", u, zero), g.call("ln", u), case(g.call("=", u, zero), at_minus_one, NAN)
+        )
         return case(g.call("<", g.call("abs", v), one), small, ln)
 
     return unary(ctx, x, fn)
