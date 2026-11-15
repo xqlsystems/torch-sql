@@ -30,7 +30,6 @@ tests assert a retention floor so the screens can't quietly skip everything.
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass, field
 
 import torch
@@ -126,19 +125,6 @@ def _near(x, points, eps=1e-3):
     return any(bool(((x - p).abs() < eps).any()) for p in points)
 
 
-#: Whether to look past findings already reported (see ``harness.KNOWN``).
-_SKIP_KNOWN = os.environ.get("TORCH_SQL_FUZZ_KNOWN", "1") != "0"
-
-
-def _known_kink_at_zero(x) -> bool:
-    """A known finding: ``logsigmoid`` and ``binary_cross_entropy_with_logits``
-    get a wrong gradient at a logit of exactly 0, where PyTorch's
-    decompositions have kinks (``abs``, ``minimum``) that cancel. A sum of
-    values can make an exact 0, so this screens it as a kink until it's
-    fixed (the review of #29; pinned in test_fuzz_device.py)."""
-    return _SKIP_KNOWN and _near(x, [0])
-
-
 UNARY = {
     "neg": _unary(torch.neg),
     "exp": _unary(torch.exp),
@@ -157,7 +143,7 @@ UNARY = {
     "gelu": _unary(lambda x: torch.nn.functional.gelu(x, approximate="tanh")),
     "log1p": _unary(torch.log1p, domain=lambda x: bool((x > -1 + 1e-3).all())),
     "softplus": _unary(torch.nn.functional.softplus),
-    "logsigmoid": _unary(torch.nn.functional.logsigmoid, kink=_known_kink_at_zero),
+    "logsigmoid": _unary(torch.nn.functional.logsigmoid),
     "silu": _unary(torch.nn.functional.silu),
     # No gradient flows through these (design §11.3).
     "detach": _unary(torch.Tensor.detach),
@@ -198,7 +184,6 @@ BINARY = {
         lambda a, b: torch.nn.functional.binary_cross_entropy_with_logits(
             a, torch.sigmoid(b), reduction="none"
         ),
-        kink=lambda a, b: _known_kink_at_zero(a),
     ),
 }
 
@@ -243,6 +228,16 @@ def _softmax(s, x, dim, log):
 
 
 def _layer_norm(s, x, k):
+    dims = tuple(range(x.dim() - k, x.dim()))
+    if (
+        x.dtype == F32
+        and x.numel()
+        and bool((x.std(dims, correction=0) < 0.05 * x.abs().amax(dims)).any())
+    ):
+        # Normalizing a nearly constant row cancels about two digits, and a
+        # float32 gradient has few to spare: the error of PyTorch's, and of
+        # torch-sql's, passes the float32 tolerance.
+        s.domain = True
     return torch.nn.functional.layer_norm(x, x.shape[x.dim() - k :])
 
 
@@ -323,8 +318,10 @@ def run(program: Program, leaves: list[torch.Tensor], screens: Screens | None = 
         if (
             step.op in ("reciprocal", "rsqrt", "div", "log")
             and _real(*args)
-            and bool((args[-1] == 0).any())
+            and bool((args[-1].abs() <= torch.finfo(args[-1].dtype).eps ** 2).any())
         ):
+            # An exact zero, or what rounding leaves of one: PyTorch's
+            # float32 variance of a constant row is 1e-18, torch-sql's 0.
             s.zero_division = True
         values.append(OPS[step.op](s, *args, *step.params))
     return values

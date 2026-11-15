@@ -306,6 +306,82 @@ def test_gradient_of_a_sum_of_an_expand(engine):
         assert w.grad.cpu().tolist() == [2.0]
 
 
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("fn", ["logsigmoid", "bce_with_logits"])
+def test_gradient_at_a_logit_of_zero(engine, fn):
+    """PyTorch decomposes ``logsigmoid`` as ``min(x, 0) - log1p(exp(-|x|))``,
+    and ``binary_cross_entropy_with_logits`` as ``(1 - y) * x -
+    logsigmoid(x)``. The sum is smooth, but each term has a kink at 0, and
+    ddx took 0 for each kink's derivative, where the two must cancel: the
+    gradient at 0 was 0 for ``logsigmoid``, where PyTorch's is 0.5. A
+    classifier head initialized to zeros gives logits of exactly 0 on its
+    first step (the review of #29)."""
+    f = {
+        "logsigmoid": torch.nn.functional.logsigmoid,
+        "bce_with_logits": lambda x: torch.nn.functional.binary_cross_entropy_with_logits(
+            x, torch.full_like(x, 0.3), reduction="none"
+        ),
+    }[fn]
+    got, expected = _gradients(f, [0.0, 1.0], engine)
+    torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_float32_infinity_keeps_the_other_gradients(engine):
+    """A float32 result that passes float32's range is rounded to an
+    infinity by a ``CASE`` whose branch is a constant, and ddx differentiated
+    the constant: every gradient upstream of it was 0. PyTorch's rounding
+    doesn't change a gradient, so ``log([0, 0.5]).sum()`` has a gradient of
+    2 for the second element (the review of #29)."""
+    got, expected = _gradients(torch.log, [0.0, 0.5], engine, torch.float32)
+    assert got.tolist() == expected.tolist() == [math.inf, 2.0], got.tolist()
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_softplus_far_past_its_threshold(engine):
+    """``softplus`` decomposes as ``where(x > 20, x, log1p(exp(x)))``. Past
+    exp's overflow, the branch not taken had a gradient of inf / inf, and
+    where's gradient multiplied it by 0, which gave NaN. PyTorch's is 1 (the
+    review of #29)."""
+    got, expected = _gradients(torch.nn.functional.softplus, [800.0, 1.0], engine)
+    torch.testing.assert_close(got, expected, rtol=1e-12, atol=0)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("fn", ["sigmoid", "silu"])
+def test_sigmoid_far_in_its_tail(engine, fn):
+    """``sigmoid`` was lowered as ``1 / (1 + exp(-x))``, whose derivative,
+    as written, is inf / inf below about -709, so the gradient was NaN
+    (issue #35)."""
+    f = {"sigmoid": torch.sigmoid, "silu": torch.nn.functional.silu}[fn]
+    got, expected = _gradients(f, [-800.0, 1.0], engine)
+    torch.testing.assert_close(got, expected, rtol=1e-12, atol=0)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_two_nested_binary_cross_entropies(engine):
+    """``binary_cross_entropy_with_logits`` of its own output, after a
+    ``softmax``, on one element, as the fuzzer drew it. ddxdb's DataFusion
+    backend decodes Substrait, the serialized query plan, with a limit of
+    100 protobuf messages, about 48 relations, and this step used to nest
+    more, so ddxdb refused it. #29's decompositions nest less."""
+    from fuzz_programs import Step
+
+    program = Program(
+        leaves=[(1,)],
+        steps=[
+            Step("softmax", (0,), (0, False)),
+            Step("bce_logits", (1, 0)),
+            Step("bce_logits", (2, 0)),
+        ],
+        data=[[-1.0]],
+        mode="smooth",
+    )
+    _, expected, _ = oracle(program, grad=True)
+    _, got = on_device(program, make_engine(engine), grad=True)
+    close(got[0], expected[0], 1.0, "the gradient")
+
+
 # -- Pinned findings ---------------------------------------------------------
 
 
@@ -372,39 +448,6 @@ def _gradients(fn, values, engine, dtype=torch.float64):
 
 
 @pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="review of #29: kinks that cancel, at a logit of 0")
-@pytest.mark.parametrize("engine", ENGINES)
-@pytest.mark.parametrize("fn", ["logsigmoid", "bce_with_logits"])
-def test_gradient_at_a_logit_of_zero(engine, fn):
-    """PyTorch decomposes ``logsigmoid`` as ``min(x, 0) - log1p(exp(-|x|))``,
-    and ``binary_cross_entropy_with_logits`` as ``(1 - y) * x -
-    logsigmoid(x)``. The sum is smooth, but each term has a kink at 0, and
-    ddx takes 0 for each kink's derivative, where the two must cancel. A classifier head
-    initialized to zeros gives logits of exactly 0 on its first step."""
-    f = {
-        "logsigmoid": torch.nn.functional.logsigmoid,
-        "bce_with_logits": lambda x: torch.nn.functional.binary_cross_entropy_with_logits(
-            x, torch.full_like(x, 0.3), reduction="none"
-        ),
-    }[fn]
-    got, expected = _gradients(f, [0.0, 1.0], engine)
-    torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-12)
-
-
-@pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="review of #29: the overflow guard is differentiated")
-@pytest.mark.parametrize("engine", ENGINES)
-def test_a_float32_infinity_keeps_the_other_gradients(engine):
-    """A float32 result that passes float32's range is rounded to an
-    infinity by a ``CASE`` whose branch is a constant, and ddx differentiates
-    the constant: every gradient upstream of it is 0. PyTorch's rounding
-    doesn't change a gradient, so ``log([0, 0.5]).sum()`` has a gradient of
-    2 for the second element, as it does in float64 on torch-sql."""
-    got, expected = _gradients(torch.log, [0.0, 0.5], engine, torch.float32)
-    assert got.tolist() == expected.tolist() == [math.inf, 2.0], got.tolist()
-
-
-@pytest.mark.pinned
 @pytest.mark.parametrize(
     "engine",
     [
@@ -412,40 +455,23 @@ def test_a_float32_infinity_keeps_the_other_gradients(engine):
         pytest.param(
             "duckdb",
             marks=pytest.mark.xfail(
-                strict=True, reason="review of #29: DuckDB raises casting the gradient to REAL"
+                strict=True, reason="xqlsystems/ddx#272: DuckDB raises casting a gradient to REAL"
             ),
         ),
     ],
 )
-def test_a_float32_gradient_past_its_range(engine):
+@pytest.mark.parametrize("fn", ["reciprocal", "exp"])
+def test_a_float32_gradient_past_its_range(engine, fn):
     """``1/x`` at 1e-30, a normal float32, has a gradient of -1e60, which is
-    -inf in float32. ddx computes it in DOUBLE and casts it to REAL, which
-    DuckDB refuses for a value past REAL's range (``ConversionException``)."""
-    got, expected = _gradients(torch.reciprocal, [1e-30, 1.0], engine, torch.float32)
-    assert got.tolist() == expected.tolist() == [-math.inf, -1.0], got.tolist()
-
-
-@pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="review of #29: where's other branch overflows")
-@pytest.mark.parametrize("engine", ENGINES)
-def test_softplus_far_past_its_threshold(engine):
-    """``softplus`` decomposes as ``where(x > 20, x, log1p(exp(x)))``. Past
-    exp's overflow, the branch not taken has a gradient of inf / inf, and
-    where's gradient multiplies it by 0, which is NaN. PyTorch's is 1."""
-    got, expected = _gradients(torch.nn.functional.softplus, [800.0, 1.0], engine)
-    torch.testing.assert_close(got, expected, rtol=1e-12, atol=0)
-
-
-@pytest.mark.pinned
-@pytest.mark.xfail(strict=True, reason="#35: sigmoid's lowering overflows in its gradient")
-@pytest.mark.parametrize("engine", ENGINES)
-@pytest.mark.parametrize("fn", ["sigmoid", "silu"])
-def test_sigmoid_far_in_its_tail(engine, fn):
-    """``sigmoid`` is ``1 / (1 + exp(-x))``, whose derivative, as written,
-    is inf / inf below about -709 (issue #35)."""
-    f = {"sigmoid": torch.sigmoid, "silu": torch.nn.functional.silu}[fn]
-    got, expected = _gradients(f, [-800.0, 1.0], engine)
-    torch.testing.assert_close(got, expected, rtol=1e-12, atol=0)
+    -inf in float32; ``exp(89)``'s is 4.5e38. ddx computes a gradient in
+    DOUBLE and casts it to REAL, which DuckDB refuses for a value past
+    REAL's range (``ConversionException``, xqlsystems/ddx#272)."""
+    f, x, want = {
+        "reciprocal": (torch.reciprocal, [1e-30, 1.0], [-math.inf, -1.0]),
+        "exp": (torch.exp, [89.0, 0.0], [math.inf, 1.0]),
+    }[fn]
+    got, expected = _gradients(f, x, engine, torch.float32)
+    assert got.tolist() == expected.tolist() == want, got.tolist()
 
 
 @pytest.mark.pinned
@@ -470,35 +496,21 @@ def test_a_negative_power_of_zero(engine):
 
 
 @pytest.mark.pinned
-@pytest.mark.parametrize(
-    "engine",
-    [
-        pytest.param(
-            "datafusion",
-            marks=pytest.mark.xfail(
-                strict=True, reason="ddxdb refuses a step nested past protobuf's depth"
-            ),
-        ),
-        "duckdb",
-    ],
-)
-def test_two_nested_binary_cross_entropies(engine):
-    """``binary_cross_entropy_with_logits`` of its own output, after a
-    ``softmax``, on one element, as the fuzzer drew it. ddxdb's DataFusion
-    backend decodes Substrait, the serialized query plan, with a limit of
-    100 protobuf messages, about 48 relations, and this step nests more."""
-    from fuzz_programs import Step
+@pytest.mark.xfail(strict=True, reason="review of #29, round 3: sigmoid's float32 gradient")
+@pytest.mark.parametrize("engine", ENGINES)
+def test_binary_cross_entropy_of_a_saturated_sigmoid(engine):
+    """In float32, ``sigmoid(x)`` rounds to exactly 1 above x of about 16.6.
+    ``binary_cross_entropy``'s backward divides by ``max(p * (1 - p),
+    1e-12)``, which is then 1e-12. PyTorch multiplies that by sigmoid's
+    backward, ``out * (1 - out)`` of the same rounded output, which is 0.
+    torch-sql computes sigmoid's derivative in DOUBLE from ``x``, about 2e-9
+    at 20, so the gradient is about 1,400 where PyTorch's is 0."""
 
-    program = Program(
-        leaves=[(1,)],
-        steps=[
-            Step("softmax", (0,), (0, False)),
-            Step("bce_logits", (1, 0)),
-            Step("bce_logits", (2, 0)),
-        ],
-        data=[[-1.0]],
-        mode="smooth",
-    )
-    _, expected, _ = oracle(program, grad=True)
-    _, got = on_device(program, make_engine(engine), grad=True)
-    close(got[0], expected[0], 1.0, "the gradient")
+    def f(x):
+        p = torch.sigmoid(x)
+        return torch.nn.functional.binary_cross_entropy(
+            p, torch.full_like(p, 0.3), reduction="none"
+        )
+
+    got, expected = _gradients(f, [17.0, 20.0, 1.0], engine, torch.float32)
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)

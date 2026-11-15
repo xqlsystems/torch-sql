@@ -82,15 +82,7 @@ def make_engine(name: str, budget="default") -> engines.Engine:
 #: ones: (engine, the start of the error's message, an op the program must
 #: use). Each has a pinned test in test_fuzz_device.py; remove its entry here
 #: when it's fixed. Set ``TORCH_SQL_FUZZ_KNOWN=0`` to see them all again.
-KNOWN: list[tuple[str, str, set[str]]] = [
-    # Each of these lowers to many nested relations, so two in a row pass
-    # the depth ddxdb's DataFusion backend can decode.
-    (
-        "datafusion",
-        "not supported by ddxdb yet: a program step nests more than",
-        {"bce_logits", "logsigmoid", "softplus"},
-    ),
-]
+KNOWN: list[tuple[str, str, set[str]]] = []
 
 
 #: Known wrong values: (engine, ops, why). A program that uses one of the
