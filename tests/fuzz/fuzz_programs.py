@@ -1,7 +1,7 @@
 """Random tensor programs, for property-based tests of the device.
 
-A *program* is a list of steps over float64 *leaves* (tensors that require a
-gradient). Each step applies one op from :data:`OPS` to earlier values, and
+A *program* is a list of steps over float64 or float32 *leaves* (tensors
+that require a gradient). Each step applies one op from :data:`OPS` to earlier values, and
 the last value is the program's output. The same program runs on PyTorch's
 CPU, which is the oracle, and on ``device="sql"``; :func:`run` is the one
 interpreter both use, so there is no second description of the program to
@@ -30,12 +30,14 @@ tests assert a retention floor so the screens can't quietly skip everything.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import torch
 from hypothesis import strategies as st
 
 F64 = torch.float64
+F32 = torch.float32
 
 
 @dataclass(frozen=True)
@@ -56,9 +58,12 @@ class Program:
     #: The values of the leaves, as nested lists of floats.
     data: list[list] = field(default_factory=list)
     mode: str = "smooth"
+    #: The leaves' dtype, which every step keeps.
+    dtype: torch.dtype = F64
 
     def __repr__(self):
-        lines = [f"Program(mode={self.mode!r}, leaves={self.leaves!r}, steps=["]
+        dtype = "" if self.dtype == F64 else f"dtype={self.dtype}, "
+        lines = [f"Program(mode={self.mode!r}, {dtype}leaves={self.leaves!r}, steps=["]
         lines += [f"    {s!r}," for s in self.steps]
         lines.append(f"], data={self.data!r})")
         return "\n".join(lines)
@@ -121,6 +126,19 @@ def _near(x, points, eps=1e-3):
     return any(bool(((x - p).abs() < eps).any()) for p in points)
 
 
+#: Whether to look past findings already reported (see ``harness.KNOWN``).
+_SKIP_KNOWN = os.environ.get("TORCH_SQL_FUZZ_KNOWN", "1") != "0"
+
+
+def _known_kink_at_zero(x) -> bool:
+    """A known finding: ``logsigmoid`` and ``binary_cross_entropy_with_logits``
+    get a wrong gradient at a logit of exactly 0, where PyTorch's
+    decompositions have kinks (``abs``, ``minimum``) that cancel. A sum of
+    values can make an exact 0, so this screens it as a kink until it's
+    fixed (the review of #29; pinned in test_fuzz_device.py)."""
+    return _SKIP_KNOWN and _near(x, [0])
+
+
 UNARY = {
     "neg": _unary(torch.neg),
     "exp": _unary(torch.exp),
@@ -137,6 +155,10 @@ UNARY = {
     "square": _unary(lambda x: x**2),
     "cube": _unary(lambda x: x**3),
     "gelu": _unary(lambda x: torch.nn.functional.gelu(x, approximate="tanh")),
+    "log1p": _unary(torch.log1p, domain=lambda x: bool((x > -1 + 1e-3).all())),
+    "softplus": _unary(torch.nn.functional.softplus),
+    "logsigmoid": _unary(torch.nn.functional.logsigmoid, kink=_known_kink_at_zero),
+    "silu": _unary(torch.nn.functional.silu),
     # No gradient flows through these (design §11.3).
     "detach": _unary(torch.Tensor.detach),
     "no_grad_double": _unary(lambda x: _no_grad(lambda: x * 2.0)),
@@ -171,15 +193,34 @@ BINARY = {
     "maximum": _binary(torch.maximum, kink=_near_tie),
     "minimum": _binary(torch.minimum, kink=_near_tie),
     "where_gt": _binary(lambda a, b: torch.where(a > b, a, b * 2.0), kink=_near_tie),
+    # The logits a, against probabilities made from b.
+    "bce_logits": _binary(
+        lambda a, b: torch.nn.functional.binary_cross_entropy_with_logits(
+            a, torch.sigmoid(b), reduction="none"
+        ),
+        kink=lambda a, b: _known_kink_at_zero(a),
+    ),
 }
 
 
 def _reduce(name):
-    fn = {"sum": torch.sum, "mean": torch.mean, "amax": torch.amax, "amin": torch.amin}[name]
+    fn = {
+        "sum": torch.sum,
+        "mean": torch.mean,
+        "amax": torch.amax,
+        "amin": torch.amin,
+        "var": torch.var,
+        "std": torch.std,
+    }[name]
 
     def apply(s, x, dims, keepdim):
         if name in ("amax", "amin") and _real(x) and _group_tie(x, list(dims)):
             s.kink = True
+        if name == "std" and _real(x):
+            # std's derivative is 1/(2 std): singular where the values tie.
+            v = torch.var(x.detach(), dim=list(dims) or None, keepdim=keepdim)
+            if not bool((v > 1e-6).all()):
+                s.domain = True
         if name in ("amax", "amin"):
             return fn(x, dim=list(dims), keepdim=keepdim)
         return fn(x, dim=list(dims) or None, keepdim=keepdim)
@@ -250,6 +291,8 @@ OTHER = {
     "reduce_mean": _reduce("mean"),
     "reduce_amax": _reduce("amax"),
     "reduce_amin": _reduce("amin"),
+    "reduce_var": _reduce("var"),
+    "reduce_std": _reduce("std"),
     "clamp": _clamp,
     "scalar": _scalar_op,
     "softmax": _softmax,
@@ -288,13 +331,26 @@ def run(program: Program, leaves: list[torch.Tensor], screens: Screens | None = 
 
 
 #: Ops that add many terms, whose rounding near overflow depends on order.
-SUMS = {"reduce_sum", "reduce_mean", "layer_norm", "softmax", "matmul", "matmul_t"}
+SUMS = {
+    "reduce_sum",
+    "reduce_mean",
+    "reduce_var",
+    "reduce_std",
+    "layer_norm",
+    "softmax",
+    "matmul",
+    "matmul_t",
+}
+
+
+#: Magnitudes past which a sum, or a product's terms, may overflow, by dtype.
+HUGE = {F64: 1e150, F32: 1e17}
 
 
 def _huge(x: torch.Tensor) -> bool:
     x = x.detach()
     finite = x[torch.isfinite(x)]
-    return bool(finite.numel()) and float(finite.abs().max()) > 1e150
+    return bool(finite.numel()) and float(finite.abs().max()) > HUGE.get(x.dtype, HUGE[F64])
 
 
 # ----------------------------------------------------------------------------
@@ -336,7 +392,18 @@ def _step(draw, shapes: list[tuple[int, ...]]):
         if r == 0:
             return None
         dims = tuple(sorted(draw(st.sets(st.integers(0, r - 1), max_size=r))))
-        name = draw(st.sampled_from(["reduce_sum", "reduce_mean", "reduce_amax", "reduce_amin"]))
+        name = draw(
+            st.sampled_from(
+                [
+                    "reduce_sum",
+                    "reduce_mean",
+                    "reduce_amax",
+                    "reduce_amin",
+                    "reduce_var",
+                    "reduce_std",
+                ]
+            )
+        )
         if name in ("reduce_amax", "reduce_amin") and not dims:
             dims = tuple(range(r))
         return Step(name, (i,), (dims, draw(st.booleans())))
@@ -457,7 +524,7 @@ NEG_NAN = -math.nan
 
 
 @st.composite
-def programs(draw, *, modes=("smooth", "ties", "extreme"), max_steps=8, max_leaves=3):
+def programs(draw, *, modes=("smooth", "ties", "extreme"), max_steps=8, max_leaves=3, dtype=F64):
     mode = draw(st.sampled_from(list(modes)))
     leaves = draw(st.lists(shapes, min_size=1, max_size=max_leaves))
     current = list(leaves)
@@ -481,13 +548,13 @@ def programs(draw, *, modes=("smooth", "ties", "extreme"), max_steps=8, max_leav
     for shape in leaves:
         n = math.prod(shape)
         data.append(draw(st.lists(_values(mode), min_size=n, max_size=n)))
-    return Program(leaves, steps, data, mode)
+    return Program(leaves, steps, data, mode, dtype)
 
 
 def leaf_tensors(program: Program, device: str, *, requires_grad: bool) -> list[torch.Tensor]:
     out = []
     for shape, values in zip(program.leaves, program.data, strict=True):
-        t = torch.tensor(values, dtype=F64).reshape(shape)
+        t = torch.tensor(values, dtype=program.dtype).reshape(shape)
         if device != "cpu":
             t = t.to(device)
         out.append(t.requires_grad_(requires_grad))
