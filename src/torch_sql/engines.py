@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import ddxdb
 import pyarrow as pa
+import torch
 
 
 @dataclass
@@ -30,6 +31,17 @@ class Gradients:
 
     def tables(self) -> list[str]:
         return [self.value, *self.gradients.values()]
+
+
+def erf(values):
+    """The error function, which neither engine has, of an Arrow array of
+    DOUBLE: PyTorch's own, ``torch.special.erf``, so its values are
+    PyTorch's. ddx differentiates ``erf`` (xqlsystems/ddx#256); exact GELU
+    calls it."""
+    if isinstance(values, pa.ChunkedArray):
+        values = values.combine_chunks()
+    x = torch.tensor(values.to_numpy(zero_copy_only=False))
+    return pa.array(torch.special.erf(x).numpy(), pa.float64())
 
 
 class Engine:
@@ -95,12 +107,13 @@ class DataFusionEngine(Engine):
     cut_budget = 400
 
     def __init__(self):
-        from datafusion import SessionConfig, SessionContext
+        from datafusion import SessionConfig, SessionContext, udf
         from ddxdb.ad import DataFusionBackend, register_stop_gradient
 
         # ddx reads views through the information schema.
         self.ctx = SessionContext(SessionConfig().with_information_schema(True))
         register_stop_gradient(self.ctx)
+        self.ctx.register_udf(udf(erf, [pa.float64()], pa.float64(), "immutable", name="erf"))
         self._backend = DataFusionBackend(self.ctx)
         self._register_ieee()
 
@@ -137,6 +150,10 @@ class DuckDBEngine(Engine):
         from ddxdb.duckdb import DuckDBBackend
 
         self.con = duckdb.connect()
+        # On this connection only: ddxdb plans on a connection of its own,
+        # which has no public way to add a function yet, so a gradient
+        # through erf is refused (grad, xqlsystems/ddx#275).
+        self.con.create_function("erf", erf, ["DOUBLE"], "DOUBLE", type="arrow", side_effects=False)
         self._backend = DuckDBBackend(self.con)
         # Registered Arrow tables, kept alive as long as they're registered.
         self._arrow: dict[str, pa.Table] = {}
@@ -169,6 +186,21 @@ class DuckDBEngine(Engine):
 
     def backend(self):
         return self._backend
+
+    def grad(self, loss, wrt):
+        import duckdb
+
+        try:
+            return super().grad(loss, wrt)
+        except duckdb.CatalogException as e:
+            if "erf" not in str(e):
+                raise
+            raise NotImplementedError(
+                "a gradient through erf (exact GELU) on DuckDB: ddxdb plans on a "
+                "connection of its own, which has no public way to add erf to yet "
+                "(xqlsystems/ddx#275). Use DataFusion, or nn.GELU(approximate='tanh'), "
+                "which differs by less than 5e-4 (design §7.3)"
+            ) from None
 
 
 ENGINES = {"datafusion": DataFusionEngine, "duckdb": DuckDBEngine}

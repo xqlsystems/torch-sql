@@ -1,6 +1,6 @@
 [project]
 name = "torch-sql"
-version = "0.1.0rc1"
+version = "0.1.0rc2"
 description = "PyTorch programs as SQL on XQL (prototype)"
 readme = "README.md"
 license = "Apache-2.0"

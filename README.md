@@ -48,7 +48,7 @@ repositories' `flake.nix` files do.
 
 ## Example
 
-nanoGPT's `model.py`, unchanged but for its GELU, trains on `device="sql"`
+nanoGPT's `model.py`, unchanged, trains on `device="sql"`
 and matches PyTorch step by step (`tests/test_nanogpt.py`). A smaller
 example, a two-layer MLP run on DuckDB:
 

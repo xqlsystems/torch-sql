@@ -703,11 +703,14 @@ each with its reason:
    Through the compile backend, DDP stays: each rank runs its compiled
    graphs, and DDP averages the gradients that ddx writes into `.grad`.
 4. **`torch_sql.sync()`** once per step, on the device only.
-5. **Exact GELU.** Samudra's CappedGELU uses the error function, `erf`. It
-   needs ddx's `erf` rule ([ddx#256](https://github.com/xqlsystems/ddx/pull/256)),
-   and spike S8 found that neither DataFusion 54 nor DuckDB 2.0 has the
-   function. Until both exist, torch-sql can use GELU's tanh form, which differs from
-   it by at most 5 × 10⁻⁴, or decompose `erf` into supported functions.
+5. **Exact GELU.** Samudra's CappedGELU uses the error function, `erf`.
+   ddx differentiates it ([ddx#256](https://github.com/xqlsystems/ddx/pull/256)),
+   but spike S8 found that neither DataFusion nor DuckDB has the function, so
+   torch-sql registers one on each engine: PyTorch's own `torch.special.erf`,
+   applied to Arrow arrays. On DuckDB a gradient through it is refused until
+   ddxdb can add a function to the connection it plans on
+   ([ddx#275](https://github.com/xqlsystems/ddx/issues/275)); GELU's tanh
+   form, which differs by at most 5 × 10⁻⁴, works there.
 6. **Gradient clipping reads back.** Samudra clips with
    `error_if_nonfinite=True`, which reads two values back every step, before
    the optimizer runs (spike S5). On the device, that is a sync in the middle
@@ -961,7 +964,7 @@ version covers what nanoGPT and Samudra use, plus the optimizer's ops.
 |---|---|
 | elementwise (`add`, `mul`, `exp`, `tanh`, ...) | a projection, or a join on all indices |
 | `clamp`, `where` | `LEAST`/`GREATEST`, `CASE` |
-| `gelu` | `erf`, which no engine has yet (§7.3 item 5); the tanh form until then |
+| `gelu`, `erf` | `erf`, which torch-sql registers on each engine (§7.3 item 5) |
 | `mm`, `bmm`, `linear`, `einsum` | a join on the contracted index, `SUM(a * b)` grouped by the rest |
 | `sum`, `mean`, `amax` | `GROUP BY` the kept indices |
 | `argmax`, `max(dim)` | `amax` joined back to `x`, then the least matching index; `max(dim)`'s values are `x` joined to that index, so the gradient goes to it, as in PyTorch |
