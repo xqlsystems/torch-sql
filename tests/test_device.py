@@ -324,13 +324,37 @@ def test_unsupported_dtype_is_refused(env):
         torch.ones(2, dtype=torch.bfloat16, device="sql")
 
 
-def test_exact_gelu_is_refused(env):
-    with pytest.raises(NotImplementedError, match="erf"):
-        torch.nn.functional.gelu(torch.ones(2, dtype=F64, device="sql"))
-    same(
-        torch.nn.functional.gelu(torch.ones(2, dtype=F64, device="sql"), approximate="tanh"),
-        torch.nn.functional.gelu(torch.ones(2, dtype=F64), approximate="tanh"),
-    )
+#: Where erf and GELU are worth checking: around 0, in the tails where 1 +
+#: erf(x) cancels, and past where erf rounds to 1.
+GELU_INPUTS = [-40.0, -6.0, -3.0, -0.5, 0.0, 1e-8, 0.7, 2.5, 10.0, math.inf, -math.inf, math.nan]
+
+
+@pytest.mark.parametrize("f", [torch.erf, torch.nn.functional.gelu], ids=["erf", "gelu"])
+def test_exact_gelu_and_erf(env, f):
+    x = torch.tensor(GELU_INPUTS, dtype=F64)
+    same(f(x.to("sql")), f(x))
+    # In float32, against the float64 result rounded: PyTorch's float32
+    # kernel loses digits in 1 + erf(x) at -3, where torch-sql, which
+    # computes erf in DOUBLE and rounds once, doesn't.
+    got = f(x.float().to("sql")).cpu()
+    torch.testing.assert_close(got, f(x).float(), rtol=1e-6, atol=1e-30, equal_nan=True)
+
+
+def test_gelu_refuses_what_pytorch_refuses(env):
+    # An integer input gave exact GELU rounded to an integer: [1] -> [0].
+    for approximate in ("none", "tanh"):
+        with pytest.raises(NotImplementedError, match="GeluKernelImpl"):
+            torch.nn.functional.gelu(torch.tensor([1], device="sql"), approximate=approximate)
+    with pytest.raises(RuntimeError, match="approximate argument"):
+        torch.nn.functional.gelu(torch.tensor([1.0], device="sql"), approximate="typo")
+
+
+def test_gradient_of_exact_gelu(env):
+    x = torch.tensor(GELU_INPUTS[:-3], dtype=F64, requires_grad=True)
+    torch.nn.functional.gelu(x).sum().backward()
+    s = x.detach().to("sql").requires_grad_()
+    torch.nn.functional.gelu(s).sum().backward()
+    same(s.grad, x.grad)
 
 
 def test_repr(env):

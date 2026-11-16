@@ -92,6 +92,7 @@ OPS = [
     "split_with_sizes",
     "nn.functional.scaled_dot_product_attention",
     "nn.functional.gelu",
+    "erf",
     "tril",
     "argmax",
     "argmin",
@@ -114,7 +115,6 @@ OPS = [
 REFUSED = {
     "div": "rounding_mode",
     "nn.functional.linear": "a 1-d input, which PyTorch's matmul squeezes in place",
-    "nn.functional.gelu": "exact GELU needs erf (xqlsystems/ddx#256)",
     "nn.functional.embedding": "padding_idx, max_norm or scale_grad_by_freq",
     "nn.functional.cross_entropy": "class weights or label smoothing",
     "nn.functional.scaled_dot_product_attention": "enable_gqa",

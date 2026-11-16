@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import ddxdb
 import pyarrow as pa
+import torch
 
 
 @dataclass
@@ -30,6 +31,17 @@ class Gradients:
 
     def tables(self) -> list[str]:
         return [self.value, *self.gradients.values()]
+
+
+def erf(values):
+    """The error function, which neither engine has, of an Arrow array of
+    DOUBLE: PyTorch's own, ``torch.special.erf``, so its values are
+    PyTorch's. ddx differentiates ``erf`` (xqlsystems/ddx#256); exact GELU
+    calls it."""
+    if isinstance(values, pa.ChunkedArray):
+        values = values.combine_chunks()
+    x = torch.tensor(values.to_numpy(zero_copy_only=False))
+    return pa.array(torch.special.erf(x).numpy(), pa.float64())
 
 
 class Engine:
@@ -95,12 +107,13 @@ class DataFusionEngine(Engine):
     cut_budget = 400
 
     def __init__(self):
-        from datafusion import SessionConfig, SessionContext
+        from datafusion import SessionConfig, SessionContext, udf
         from ddxdb.ad import DataFusionBackend, register_stop_gradient
 
         # ddx reads views through the information schema.
         self.ctx = SessionContext(SessionConfig().with_information_schema(True))
         register_stop_gradient(self.ctx)
+        self.ctx.register_udf(udf(erf, [pa.float64()], pa.float64(), "immutable", name="erf"))
         self._backend = DataFusionBackend(self.ctx)
         self._register_ieee()
 
@@ -134,9 +147,14 @@ class DuckDBEngine(Engine):
 
     def __init__(self):
         import duckdb
-        from ddxdb.duckdb import DuckDBBackend
+        from ddxdb.duckdb import DuckDBBackend, create_function
 
         self.con = duckdb.connect()
+        # Through ddxdb, which also registers it on the connection it plans
+        # on (xqlsystems/ddx#275).
+        create_function(
+            self.con, "erf", erf, ["DOUBLE"], "DOUBLE", type="arrow", side_effects=False
+        )
         self._backend = DuckDBBackend(self.con)
         # Registered Arrow tables, kept alive as long as they're registered.
         self._arrow: dict[str, pa.Table] = {}

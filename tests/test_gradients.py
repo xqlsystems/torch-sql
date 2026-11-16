@@ -15,7 +15,6 @@ GRAD_REFUSED = {
     "div": "rounding_mode",
     "pow": "ddx differentiates power(x, y) only when x or y is a constant",
     "nn.functional.linear": "a 1-d input, which PyTorch's matmul squeezes in place",
-    "nn.functional.gelu": "exact GELU needs erf (xqlsystems/ddx#256)",
     "nn.functional.embedding": "padding_idx, max_norm or scale_grad_by_freq",
     "nn.functional.cross_entropy": "class weights or label smoothing",
     "nn.functional.scaled_dot_product_attention": "enable_gqa",
@@ -362,6 +361,7 @@ DIFFERENTIABLE = [
     "split_with_sizes",
     "nn.functional.scaled_dot_product_attention",
     "nn.functional.gelu",
+    "erf",
     "max",
     "min",
     "unbind",
@@ -480,11 +480,10 @@ def test_op_gradient(engine, info, dtype):
                 )
         ran += 1
     if not ran:
-        pytest.skip(
-            f"every sample refused: {GRAD_REFUSED[info.name]}"
-            if refused
-            else "no sample with a gradient"
+        why = GRAD_REFUSED.get(info.name) or next(
+            (v for k, v in ENGINE_REFUSED.items() if k[:2] == (info.name, engine.name)), None
         )
+        pytest.skip(f"every sample refused: {why}" if refused else "no sample with a gradient")
 
 
 @pytest.mark.parametrize("p", [2, 3, 0.5, -1.5])

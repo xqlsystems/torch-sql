@@ -346,15 +346,40 @@ def relu(ctx, x):
 _GELU_BETA = math.sqrt(2.0) * (2.0 / math.sqrt(math.pi)) * 0.5
 
 
+def _erf(v, dtype):
+    """``erf(v)``, in DOUBLE: the engines' ``erf`` takes DOUBLE, and a float32
+    result is rounded once (:func:`torch_sql.sql.real`)."""
+    if dtype == torch.float32:
+        v = g.call("cast:DOUBLE", v)
+    return g.call("erf", v)
+
+
+@op(aten.erf.default)
+def erf(ctx, x):
+    return unary(ctx, x, lambda v: _erf(v, ctx.out.dtype))
+
+
 @op(aten.gelu.default)
 def gelu(ctx, x, *, approximate="none"):
-    if approximate != "tanh":
-        raise NotImplementedError(
-            "exact GELU needs erf, which neither DataFusion nor DuckDB has and ddx "
-            "can't differentiate yet (xqlsystems/ddx#256); use "
-            "nn.GELU(approximate='tanh'), which differs by less than 5e-4 (design §7.3)"
-        )
+    """``v * (1 + erf(v / sqrt(2))) / 2``, as PyTorch computes exact GELU, or
+    its tanh form."""
     dt = ctx.out.dtype
+    if dt not in FLOATS:
+        # As PyTorch's CPU kernel refuses it, rather than a GELU rounded to
+        # an integer.
+        raise NotImplementedError(f'"GeluKernelImpl" not implemented for {dt}')
+    if approximate != "tanh":
+
+        def exact(v):
+            # In DOUBLE, rounded once for float32: x / sqrt(2) rounded to
+            # float32 moves erf's tail, by 2e-6 of GELU at -6.
+            if dt == torch.float32:
+                v = g.call("cast:DOUBLE", v)
+            f64 = torch.float64
+            half, one = scalar(0.5, f64), scalar(1.0, f64)
+            return v * half * (one + g.call("erf", v * scalar(math.sqrt(0.5), f64)))
+
+        return unary(ctx, x, exact)
 
     def fn(v):
         inner = scalar(_GELU_BETA, dt) * (v + scalar(0.044715, dt) * v * v * v)

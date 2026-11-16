@@ -76,6 +76,8 @@ FUNCTIONS = {
     "greatest": "greatest",
     "least": "least",
     "isnan": "isnan",
+    # Registered on each engine (torch_sql.engines.erf).
+    "erf": "erf",
 }
 
 AGGREGATES = {"SUM", "AVG", "MAX", "MIN", "COUNT"}

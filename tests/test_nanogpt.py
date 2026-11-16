@@ -1,12 +1,9 @@
 """nanoGPT on device="sql", trained step by step against PyTorch (M1).
 
-The model is nanoGPT's ``model.py``, unchanged (``tests/nanogpt``), with one
-substitution: its exact GELU becomes the tanh form, since exact GELU needs
-``erf``, which neither engine has (xqlsystems/ddx#256). xarray-sql's
-``benchmarks/ml/02_nanogpt.py`` makes the same substitution.
+The model is nanoGPT's ``model.py``, unchanged (``tests/nanogpt``). Its
+exact GELU needs ``erf``, which torch-sql registers on each engine.
 """
 
-import pytest
 import torch
 from nanogpt.model import GPT, GPTConfig
 
@@ -20,12 +17,7 @@ def gpt(layers=1, dropout=0.0, dtype=F64):
         block_size=8, vocab_size=11, n_layer=layers, n_head=2, n_embd=8, dropout=dropout, bias=True
     )
     torch.manual_seed(0)
-    model = GPT(config).to(dtype)
-    for module in model.modules():
-        for name, child in module.named_children():
-            if isinstance(child, torch.nn.GELU):
-                setattr(module, name, torch.nn.GELU(approximate="tanh"))
-    return model
+    return GPT(config).to(dtype)
 
 
 def batch(step):
@@ -107,12 +99,3 @@ def test_inference_reads_the_last_position(engine):
         logits, loss = gpt().to("sql")(idx.to("sql"))
         assert loss is None
         close(logits, expected)
-
-
-def test_exact_gelu_is_refused(engine):
-    torch.manual_seed(0)
-    model = GPT(GPTConfig(block_size=8, vocab_size=11, n_layer=1, n_head=2, n_embd=8)).double()
-    idx, targets = batch(0)
-    with torch_sql.Environment(engine):
-        with pytest.raises(NotImplementedError, match="erf"):
-            model.to("sql")(idx.to("sql"), targets.to("sql"))
