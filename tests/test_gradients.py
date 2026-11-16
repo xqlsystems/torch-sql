@@ -25,9 +25,6 @@ GRAD_REFUSED = {
 ENGINE_REFUSED = {
     # A 0-d input's gather is a CTE reading only a one-row table's value.
     ("gather", "duckdb", "does not depend on any wrt column"): "xqlsystems/ddx#264",
-    # ddxdb plans on a connection torch-sql can't add erf to.
-    ("nn.functional.gelu", "duckdb", "erf"): "xqlsystems/ddx#275",
-    ("erf", "duckdb", "erf"): "xqlsystems/ddx#275",
 }
 
 

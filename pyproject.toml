@@ -20,7 +20,7 @@ dependencies = [
     "torch>=2.15",
     "numpy>=1.26",
     "pyarrow>=21",
-    "ddxdb>=0.4.9,<0.5",
+    "ddxdb>=0.4.10,<0.5",
 ]
 
 [project.urls]
@@ -30,8 +30,8 @@ Issues = "https://github.com/xqlsystems/torch-sql/issues"
 
 [project.optional-dependencies]
 # The engines (design §12.3). At least one is needed to run anything.
-datafusion = ["ddxdb[datafusion]>=0.4.9,<0.5"]
-duckdb = ["ddxdb[duckdb]>=0.4.9,<0.5"]
+datafusion = ["ddxdb[datafusion]>=0.4.10,<0.5"]
+duckdb = ["ddxdb[duckdb]>=0.4.10,<0.5"]
 
 [dependency-groups]
 dev = [

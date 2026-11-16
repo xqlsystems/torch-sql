@@ -707,10 +707,9 @@ each with its reason:
    ddx differentiates it ([ddx#256](https://github.com/xqlsystems/ddx/pull/256)),
    but spike S8 found that neither DataFusion nor DuckDB has the function, so
    torch-sql registers one on each engine: PyTorch's own `torch.special.erf`,
-   applied to Arrow arrays. On DuckDB a gradient through it is refused until
-   ddxdb can add a function to the connection it plans on
-   ([ddx#275](https://github.com/xqlsystems/ddx/issues/275)); GELU's tanh
-   form, which differs by at most 5 × 10⁻⁴, works there.
+   applied to Arrow arrays. On DuckDB it registers it through ddxdb's
+   `create_function`, which also adds it to the connection ddxdb plans on
+   ([ddx#275](https://github.com/xqlsystems/ddx/issues/275)).
 6. **Gradient clipping reads back.** Samudra clips with
    `error_if_nonfinite=True`, which reads two values back every step, before
    the optimizer runs (spike S5). On the device, that is a sync in the middle

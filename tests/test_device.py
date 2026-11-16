@@ -344,10 +344,6 @@ def test_gradient_of_exact_gelu(env):
     x = torch.tensor(GELU_INPUTS[:-3], dtype=F64, requires_grad=True)
     torch.nn.functional.gelu(x).sum().backward()
     s = x.detach().to("sql").requires_grad_()
-    if env.engine.name == "duckdb":
-        with pytest.raises(NotImplementedError, match="ddx#275"):
-            torch.nn.functional.gelu(s).sum().backward()
-        return
     torch.nn.functional.gelu(s).sum().backward()
     same(s.grad, x.grad)
 
