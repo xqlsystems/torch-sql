@@ -364,6 +364,10 @@ def gelu(ctx, x, *, approximate="none"):
     """``v * (1 + erf(v / sqrt(2))) / 2``, as PyTorch computes exact GELU, or
     its tanh form."""
     dt = ctx.out.dtype
+    if dt not in FLOATS:
+        # As PyTorch's CPU kernel refuses it, rather than a GELU rounded to
+        # an integer.
+        raise NotImplementedError(f'"GeluKernelImpl" not implemented for {dt}')
     if approximate != "tanh":
 
         def exact(v):

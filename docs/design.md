@@ -963,7 +963,7 @@ version covers what nanoGPT and Samudra use, plus the optimizer's ops.
 |---|---|
 | elementwise (`add`, `mul`, `exp`, `tanh`, ...) | a projection, or a join on all indices |
 | `clamp`, `where` | `LEAST`/`GREATEST`, `CASE` |
-| `gelu`, `erf` | `erf`, which torch-sql registers on each engine (§7.3 item 5) |
+| `gelu`, `erf` | `erf`, which torch-sql registers on each engine ([§7.3](#73-changes-to-samudra) item 5) |
 | `mm`, `bmm`, `linear`, `einsum` | a join on the contracted index, `SUM(a * b)` grouped by the rest |
 | `sum`, `mean`, `amax` | `GROUP BY` the kept indices |
 | `argmax`, `max(dim)` | `amax` joined back to `x`, then the least matching index; `max(dim)`'s values are `x` joined to that index, so the gradient goes to it, as in PyTorch |

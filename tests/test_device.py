@@ -340,6 +340,15 @@ def test_exact_gelu_and_erf(env, f):
     torch.testing.assert_close(got, f(x).float(), rtol=1e-6, atol=1e-30, equal_nan=True)
 
 
+def test_gelu_refuses_what_pytorch_refuses(env):
+    # An integer input gave exact GELU rounded to an integer: [1] -> [0].
+    for approximate in ("none", "tanh"):
+        with pytest.raises(NotImplementedError, match="GeluKernelImpl"):
+            torch.nn.functional.gelu(torch.tensor([1], device="sql"), approximate=approximate)
+    with pytest.raises(RuntimeError, match="approximate argument"):
+        torch.nn.functional.gelu(torch.tensor([1.0], device="sql"), approximate="typo")
+
+
 def test_gradient_of_exact_gelu(env):
     x = torch.tensor(GELU_INPUTS[:-3], dtype=F64, requires_grad=True)
     torch.nn.functional.gelu(x).sum().backward()
